@@ -36,114 +36,105 @@
     </div>
 
     <script>
-        /*
-         * Automatically finds:
-         *   newest season
-         *   newest week
-         *   corresponding week_N_report.html
-         *
-         * Expected structure:
-         *
-         *   /
-         *   ├── index.html
-         *   ├── 2026/
-         *   │   ├── week_0_report.html
-         *   │   ├── week_1_report.html
-         *   │   └── ...
-         *   └── 2027/
-         *       └── ...
-         */
+    /*
+     * Automatically finds:
+     *   newest season under reports/
+     *   newest week
+     *   corresponding week_N_report.html
+     */
 
-        const username = "le-pantman";
-        const repo = "dynasty-power-rankings";
+    const username = "le-pantman";
+    const repo = "dynasty-power-rankings";
 
-        async function findLatestReport() {
-            try {
-                // Get all files/folders in the repository root
-                const rootResponse = await fetch(
-                    `https://api.github.com/repos/${username}/${repo}/contents/`
-                );
+    async function findLatestReport() {
+        try {
+            // Get all files/folders inside /reports
+            const reportsResponse = await fetch(
+                `https://api.github.com/repos/${username}/${repo}/contents/reports`
+            );
 
-                if (!rootResponse.ok) {
-                    throw new Error("Could not access GitHub repository.");
-                }
-
-                const rootContents = await rootResponse.json();
-
-                // Find folders whose names are years, e.g. 2026, 2027
-                const seasons = rootContents
-                    .filter(item =>
-                        item.type === "dir" &&
-                        /^\d{4}$/.test(item.name)
-                    )
-                    .map(item => parseInt(item.name))
-                    .sort((a, b) => b - a);
-
-                if (seasons.length === 0) {
-                    throw new Error("No season folders found.");
-                }
-
-                // Newest season
-                const latestSeason = seasons[0];
-
-                // Get contents of newest season
-                const seasonResponse = await fetch(
-                    `https://api.github.com/repos/${username}/${repo}/contents/${latestSeason}`
-                );
-
-                if (!seasonResponse.ok) {
-                    throw new Error("Could not access latest season.");
-                }
-
-                const seasonContents = await seasonResponse.json();
-
-                // Find files like week_0_report.html, week_1_report.html, etc.
-                const weeks = seasonContents
-                    .filter(item =>
-                        item.type === "file" &&
-                        /^week_\d+_report\.html$/i.test(item.name)
-                    )
-                    .map(item => {
-                        const match = item.name.match(
-                            /^week_(\d+)_report\.html$/i
-                        );
-
-                        return {
-                            week: parseInt(match[1]),
-                            file: item.name
-                        };
-                    })
-                    .sort((a, b) => b.week - a.week);
-
-                if (weeks.length === 0) {
-                    throw new Error(
-                        `No weekly reports found for ${latestSeason}.`
-                    );
-                }
-
-                // Newest week
-                const latestWeek = weeks[0];
-
-                // Redirect to the report
-                const reportUrl =
-                    `${latestSeason}/${latestWeek.file}`;
-
-                window.location.replace(reportUrl);
-
-            } catch (error) {
-                console.error(error);
-
-                document.getElementById("message").innerHTML = `
-                    <div class="error">
-                        <h2>Fantasy Football Rankings</h2>
-                        <p>Unable to find the latest report.</p>
-                        <p>${error.message}</p>
-                    </div>
-                `;
+            if (!reportsResponse.ok) {
+                throw new Error("Could not access the reports folder.");
             }
-        }
 
-        findLatestReport();
+            const reportsContents = await reportsResponse.json();
+
+            // Find folders whose names are years, e.g. 2026, 2027
+            const seasons = reportsContents
+                .filter(item =>
+                    item.type === "dir" &&
+                    /^\d{4}$/.test(item.name)
+                )
+                .map(item => parseInt(item.name))
+                .sort((a, b) => b - a);
+
+            if (seasons.length === 0) {
+                throw new Error("No season folders found in reports.");
+            }
+
+            // Newest season
+            const latestSeason = seasons[0];
+
+            // Get contents of /reports/<year>
+            const seasonResponse = await fetch(
+                `https://api.github.com/repos/${username}/${repo}/contents/reports/${latestSeason}`
+            );
+
+            if (!seasonResponse.ok) {
+                throw new Error(
+                    `Could not access reports/${latestSeason}.`
+                );
+            }
+
+            const seasonContents = await seasonResponse.json();
+
+            // Find files like week_0_report.html, week_1_report.html, etc.
+            const weeks = seasonContents
+                .filter(item =>
+                    item.type === "file" &&
+                    /^week_\d+_report\.html$/i.test(item.name)
+                )
+                .map(item => {
+                    const match = item.name.match(
+                        /^week_(\d+)_report\.html$/i
+                    );
+
+                    return {
+                        week: parseInt(match[1]),
+                        file: item.name
+                    };
+                })
+                .sort((a, b) => b.week - a.week);
+
+            if (weeks.length === 0) {
+                throw new Error(
+                    `No weekly reports found for ${latestSeason}.`
+                );
+            }
+
+            // Newest week
+            const latestWeek = weeks[0];
+
+            // Redirect to /reports/<year>/week_N_report.html
+            const reportUrl =
+                `reports/${latestSeason}/${latestWeek.file}`;
+
+            window.location.replace(reportUrl);
+
+        } catch (error) {
+            console.error(error);
+
+            document.getElementById("message").innerHTML = `
+                <div class="error">
+                    <h2>Fantasy Football Rankings</h2>
+                    <p>Unable to find the latest report.</p>
+                    <p>${error.message}</p>
+                </div>
+            `;
+        }
+    }
+
+    findLatestReport();
     </script>
 </body>
 </html>

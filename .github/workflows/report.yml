@@ -1,4 +1,4 @@
-name: Hourly league report
+name: hourly-league-report
 
 on:
   schedule:

@@ -417,14 +417,16 @@ def find_roster_id_by_username(rosters, users, username):
     return None
 
 
-def best_teams_by_column(rows, cols, key_col):
+def _extreme_teams_by_column(rows, cols, key_col, best):
     """
-    {label: {team, ...}} -- whichever row(s) hold the best raw value for that
-    column, so the caller can bold them. Skips key_col (it's the sort column
+    {label: {team, ...}} -- whichever row(s) hold the best (or, if best=False,
+    the worst) raw value for that column. Skips key_col (it's the sort column
     and already rendered bold) and skips columns with no data (all None).
-    Ties are all marked best.
+    Ties are all marked. Shared by best_teams_by_column/worst_teams_by_column
+    below so "best" and "worst" can never disagree about which direction a
+    column runs.
     """
-    best = {}
+    out = {}
     for label, direction, _ in cols:
         if label == key_col:
             continue
@@ -432,9 +434,22 @@ def best_teams_by_column(rows, cols, key_col):
                       if r["raw"][label] is not None]
         if not candidates:
             continue
-        target = (max if direction == "up" else min)(v for v, _ in candidates)
-        best[label] = {team for v, team in candidates if v == target}
-    return best
+        want_max = (direction == "up") if best else (direction == "down")
+        target = (max if want_max else min)(v for v, _ in candidates)
+        out[label] = {team for v, team in candidates if v == target}
+    return out
+
+
+def best_teams_by_column(rows, cols, key_col):
+    """Bolded in the report. See _extreme_teams_by_column."""
+    return _extreme_teams_by_column(rows, cols, key_col, best=True)
+
+
+def worst_teams_by_column(rows, cols, key_col):
+    """Italicized in the report. See _extreme_teams_by_column. Note a team
+    can be both best and worst in a column (e.g. only one row has data for
+    it) -- that's not a bug, it just gets bold+italic."""
+    return _extreme_teams_by_column(rows, cols, key_col, best=False)
 
 
 def season_dir(season):
@@ -552,6 +567,7 @@ td.mv{width:42px;text-align:left;padding-left:0}
 td.team{text-align:left;font-weight:650;letter-spacing:-.2px}
 td.key{font-weight:800}
 td.best{font-weight:800}
+td.worst{font-style:italic}
 .d{font-size:10.5px;font-weight:700}
 .d.up{color:#16a34a}.d.down{color:#dc2626}.d.flat{color:#c2c7d0}
 .legend{padding:16px 26px 22px;background:#fafbfc;border-top:1px solid #e3e5ea}
@@ -574,6 +590,7 @@ color:#9aa1ac}
 def render_page(title, subtitle, cols, rows, prev_week, key_col, note):
     has_prev = prev_week is not None
     best = best_teams_by_column(rows, cols, key_col)
+    worst = worst_teams_by_column(rows, cols, key_col)
 
     th = "".join(
         f'<th>{label}<span class="dir">{ARROW[d]}</span></th>'
@@ -585,10 +602,13 @@ def render_page(title, subtitle, cols, rows, prev_week, key_col, note):
         for label, _, _ in cols:
             if label == key_col:
                 cls = "key"
-            elif r["team"] in best.get(label, ()):
-                cls = "best"
             else:
-                cls = ""
+                classes = []
+                if r["team"] in best.get(label, ()):
+                    classes.append("best")
+                if r["team"] in worst.get(label, ()):
+                    classes.append("worst")
+                cls = " ".join(classes)
             cells += f'<td class="{cls}">{r["disp"][label]}</td>'
         body += (f'<tr style="background:{row_tint(r["delta"])}">'
                  f'<td class="rank">{r["rank"]}</td>'
@@ -607,7 +627,7 @@ def render_page(title, subtitle, cols, rows, prev_week, key_col, note):
 <div class="head"><h1>{html.escape(title)}</h1><div class="sub">{html.escape(subtitle)}</div></div>
 <table><thead><tr><th class="l">#</th><th class="l"></th><th class="l">Team</th>{th}</tr></thead>
 <tbody>{body}</tbody></table>
-<div class="legend"><h2>Legend &nbsp;&middot;&nbsp; {ARROW['up']} higher is better &nbsp;&middot;&nbsp; {ARROW['down']} lower is better &nbsp;&middot;&nbsp; <b>bold</b> = best in column</h2>{legend}</div>
+<div class="legend"><h2>Legend &nbsp;&middot;&nbsp; {ARROW['up']} higher is better &nbsp;&middot;&nbsp; {ARROW['down']} lower is better &nbsp;&middot;&nbsp; <b>bold</b> = best in column &nbsp;&middot;&nbsp; <i>italic</i> = worst in column</h2>{legend}</div>
 <div class="note">{movement} {html.escape(note)}</div></div>"""
 
 

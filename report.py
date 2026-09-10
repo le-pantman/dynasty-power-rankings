@@ -567,7 +567,7 @@ td.mv{width:42px;text-align:left;padding-left:0}
 td.team{text-align:left;font-weight:650;letter-spacing:-.2px}
 td.key{font-weight:800}
 td.best{font-weight:800}
-td.worst{font-style:italic}
+.worst{color:#9ca3af}
 .d{font-size:10.5px;font-weight:700}
 .d.up{color:#16a34a}.d.down{color:#dc2626}.d.flat{color:#c2c7d0}
 .legend{padding:16px 26px 22px;background:#fafbfc;border-top:1px solid #e3e5ea}
@@ -627,7 +627,7 @@ def render_page(title, subtitle, cols, rows, prev_week, key_col, note):
 <div class="head"><h1>{html.escape(title)}</h1><div class="sub">{html.escape(subtitle)}</div></div>
 <table><thead><tr><th class="l">#</th><th class="l"></th><th class="l">Team</th>{th}</tr></thead>
 <tbody>{body}</tbody></table>
-<div class="legend"><h2>Legend &nbsp;&middot;&nbsp; {ARROW['up']} higher is better &nbsp;&middot;&nbsp; {ARROW['down']} lower is better &nbsp;&middot;&nbsp; <b>bold</b> = best in column &nbsp;&middot;&nbsp; <i>italic</i> = worst in column</h2>{legend}</div>
+<div class="legend"><h2>Legend &nbsp;&middot;&nbsp; {ARROW['up']} higher is better &nbsp;&middot;&nbsp; {ARROW['down']} lower is better &nbsp;&middot;&nbsp; <b>bold</b> = best in column &nbsp;&middot;&nbsp; <span class="worst">grey</span> = worst in column</h2>{legend}</div>
 <div class="note">{movement} {html.escape(note)}</div></div>"""
 
 

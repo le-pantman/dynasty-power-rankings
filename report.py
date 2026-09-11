@@ -627,7 +627,7 @@ def render_page(title, subtitle, cols, rows, prev_week, key_col, note):
 <div class="head"><h1>{html.escape(title)}</h1><div class="sub">{html.escape(subtitle)}</div></div>
 <table><thead><tr><th class="l">#</th><th class="l"></th><th class="l">Team</th>{th}</tr></thead>
 <tbody>{body}</tbody></table>
-<div class="legend"><h2>Legend &nbsp;&middot;&nbsp; {ARROW['up']} higher is better &nbsp;&middot;&nbsp; {ARROW['down']} lower is better &nbsp;&middot;&nbsp; <b>bold</b> = best in column &nbsp;&middot;&nbsp; <span class="worst">grey</span> = worst in column</h2>{legend}</div>
+<div class="legend"><h2>Legend &nbsp;&middot;&nbsp; {ARROW['up']} higher is better &nbsp;&middot;&nbsp; {ARROW['down']} lower is better</h2>{legend}</div>
 <div class="note">{movement} {html.escape(note)}</div></div>"""
 
 

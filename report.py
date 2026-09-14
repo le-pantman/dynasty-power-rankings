@@ -62,25 +62,25 @@ FUTURE_PICK_SEASONS = None
 # draft this league has is the 25-round startup, and the 2027 rookie draft
 # doesn't exist yet. Set it to match your league. FantasyCalc only publishes
 # values through the 4th, so anything beyond 4 contributes nothing anyway.
-ROOKIE_DRAFT_ROUNDS = 4
+ROOKIE_DRAFT_ROUNDS = 3
 
 # Power rating weights. Interpolated from EARLY -> LATE as the season plays out,
 # so preseason leans on roster value/projection and December leans on results.
 PWR_WEIGHTS_EARLY = {
-    "VALUE": 0.50, "EXP_WR": 0.50, "PF_AVG": 0.00,
-    "COACH": 0.00, "PF_VAR": 0.00, "LUCK": 0.00,
+    "VALUE": 0.40, "EXP_WR": 0.40, "PF_AVG": 0.10,
+    "COACH": 0.05, "PF_VAR": -0.05, "LUCK": -0.05,
 }
 PWR_WEIGHTS_LATE = {
     "VALUE": 0.00, "EXP_WR": 0.50, "PF_AVG": 0.50,
-    "COACH": 0.20, "PF_VAR": -0.10, "LUCK": -0.10,
+    "COACH": 0.15, "PF_VAR": -0.05, "LUCK": -0.10,
 }
 # Note: PF_VAR and LUCK carry negative weight late -- a high-variance team is
 # less reliable, and a lucky team (wins > all-play wins) is due to regress.
 
 LONG_WEIGHTS = {
-    "AGE_AVG": -0.75,   # younger is better
-    "DYN": 0.50,        # dynasty value above redraft value = long-term assets
-    "PICKS": 0.75,
+    "AGE_AVG": -0.25,   # younger is better
+    "DYN": 0.35,        # dynasty value above redraft value = long-term assets
+    "PICKS": 0.40,
 }
 
 # --- running joke -----------------------------------------------------------

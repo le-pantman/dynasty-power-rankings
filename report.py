@@ -65,10 +65,7 @@ CACHE_TTL = 60 * 60 * 12   # 12h -- player map is ~5MB, don't refetch constantly
 # None = auto (the 3 seasons after the current one).
 FUTURE_PICK_SEASONS = None
 
-# Rounds in a FUTURE ROOKIE draft. This cannot be read from the API: the only
-# draft this league has is the 25-round startup, and the 2027 rookie draft
-# doesn't exist yet. Set it to match your league. FantasyCalc only publishes
-# values through the 4th, so anything beyond 4 contributes nothing anyway.
+# Rounds in a FUTURE ROOKIE draft.
 ROOKIE_DRAFT_ROUNDS = 3
 
 # Power rating weights. Interpolated from EARLY -> LATE as the season plays out,

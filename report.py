@@ -74,12 +74,12 @@ ROOKIE_DRAFT_ROUNDS = 3
 # Power rating weights. Interpolated from EARLY -> LATE as the season plays out,
 # so preseason leans on roster value/projection and December leans on results.
 PWR_WEIGHTS_EARLY = {
-    "VALUE": 0.40, "EXP_WR": 0.40, "PF_AVG": 0.10,
-    "COACH": 0.05, "PF_VAR": -0.05, "LUCK": -0.05,
+    "VALUE": 0.40, "PF_AVG": 0.30, "COACH": 0.10, "EXP_WR": 0.25,
+    "PF_VAR": -0.05, "LUCK": -0.00,
 }
 PWR_WEIGHTS_LATE = {
-    "VALUE": 0.00, "EXP_WR": 0.50, "PF_AVG": 0.50,
-    "COACH": 0.15, "PF_VAR": -0.05, "LUCK": -0.10,
+    "VALUE": 0.00, "EXP_WR": 0.50, "COACH": 0.40, "PF_AVG": 0.25,
+    "PF_VAR": -0.05, "LUCK": -0.10,
 }
 # Note: PF_VAR and LUCK carry negative weight late -- a high-variance team is
 # less reliable, and a lucky team (wins > all-play wins) is due to regress.
@@ -120,8 +120,10 @@ CURRENT_COLS = [
                        "the maximum the roster could have scored."),
     ("EXP WR", "up",   "Expected Win Rate: Wins so far plus projected win probability for every "
                        "remaining matchup, divided by the number of weeks in the season."),
-    ("LUCK",   "down", "Luck Factor: Win rate divided by all-play win rate. Above 1.00 "
-                       "indicates an easier schedule."),
+    ("LUCK",   "down", "Luck Factor: How far your actual win rate sits above or below "
+                       "your all-play (deserved) win rate, as a percentage of that "
+                       "deserved rate. Positive means your record is better than your "
+                       "scoring earned; negative means worse."),
     ("PWR",    "up",   "Power Rating: Weighted blend of the z-scores above, scaled 0-100. "
                        "Weighting shifts from roster value toward results as "
                        "the season progresses."),
@@ -879,9 +881,29 @@ def main():
               for r in rids}
     coach = {r: (100.0 * sum(weekly[r]) / sum(optimal[r])
                  if sum(optimal[r]) > 0 else 0.0) for r in rids}
-    luck = {r: ((wins[r] / len(completed)) /
-                (allplay_wins[r] / allplay_games[r])
-                if completed and allplay_wins[r] > 0 else 1.0) for r in rids}
+    # LUCK as a percentage: how far your actual win rate sits above or below
+    # your all-play ("deserved") win rate, relative to that deserved rate.
+    # +25 means your record is 25% better than your scoring earned; -100
+    # means you have zero wins despite a schedule-deserved win rate above
+    # zero (as unlucky as it gets). This is a straight linear rescale of the
+    # old ratio (percent = (ratio - 1) * 100), so it changes nothing about
+    # PWR/rankings -- z-scores are invariant to affine transforms -- it just
+    # makes the number itself read sensibly instead of centering on 1.00.
+    #
+    # allplay_win_rate is 0 only when a team has never out-scored anyone in
+    # any completed week -- by construction their actual win rate is then
+    # also 0 (you can't beat an opponent who outscored everyone including
+    # you), so there's no daylight between "deserved" and "actual" to
+    # measure: 0% (fully deserved, no luck involved either way) is the
+    # correct value here, not an undefined division.
+    luck = {}
+    for r in rids:
+        if not completed or allplay_wins[r] == 0:
+            luck[r] = 0.0
+            continue
+        actual_wr = wins[r] / len(completed)
+        allplay_wr = allplay_wins[r] / allplay_games[r]
+        luck[r] = (actual_wr - allplay_wr) / allplay_wr * 100.0
 
     # --- expected win rate --------------------------------------------------
     roster_players = {r["roster_id"]: (r.get("players") or []) for r in rosters}
@@ -1032,7 +1054,7 @@ def main():
                    "LUCK": luck[r] if have else None,
                    "PWR": pwr[r]} for r in rids}
     cur_fmt = {"VALUE": ".0f", "PF AVG": ".1f", "PF VAR": ".1f", "COACH": ".1f",
-               "EXP WR": ".3f", "LUCK": ".2f", "PWR": ".1f"}
+               "EXP WR": ".3f", "LUCK": "+.0f", "PWR": ".1f"}
 
     fut_raw = {r: {"AGE AVG": age_avg[r], "DYN": dyn_diff[r],
                    "PICKS": picks[r], "LONG": long_score[r]} for r in rids}
@@ -1054,7 +1076,7 @@ def main():
                 v = raws[r][label]
                 disp[label] = ("-" if v is None else
                                format(v, fmts[label]) +
-                               ("%" if label == "COACH" else ""))
+                               ("%" if label in ("COACH", "LUCK") else ""))
             # roster_id is the primary match key -- it doesn't change when a
             # team gets renamed. Owner username is a fallback for the rare
             # case of a recreated league; team name is a last-resort fallback

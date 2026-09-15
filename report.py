@@ -613,8 +613,14 @@ color:#6b7280;margin-bottom:11px;font-weight:700}
 .li .a{font-size:7.5px;color:#9aa1ac}
 .note{padding:11px 26px 16px;font-size:10.5px;color:#8b919c;line-height:1.5;
 background:#fafbfc}
-.footer{max-width:940px;margin:0 auto 26px;text-align:center;font-size:11px;
-color:#9aa1ac}
+.footer{max-width:940px;margin:0 auto 26px;display:flex;align-items:center;
+font-size:11px;color:#9ca1ac}
+.footer .nav-prev{flex:1 1 0;text-align:right}
+.footer .nav-next{flex:1 1 0;text-align:left}
+.footer .nav-prev a,.footer .nav-next a{color:#6b7280;text-decoration:none;font-weight:700}
+.footer .nav-prev a:hover,.footer .nav-next a:hover{color:#12141a}
+.footer .sep{margin:0 8px;color:#d1d5db}
+.footer-text{flex:0 0 auto;padding:0 4px}
 @media print{body{background:#fff;padding:0}
 .page{box-shadow:none;margin:0;page-break-after:always;border-radius:0}
 .footer{display:none}}
@@ -661,8 +667,55 @@ def render_page(title, subtitle, cols, rows, prev_week, key_col, note):
 <div class="note">{html.escape(note)}</div></div>"""
 
 
-def write_html(path, league_name, pages, generated_at):
-    footer = f'<div class="footer">Last updated {html.escape(generated_at)}</div>'
+def write_html(path, league_name, pages, generated_at, week, season):
+    """
+    Writes the report and wires up prev/next week navigation in the footer.
+
+    The tricky part: this file, once written for week N, is never touched
+    again once week N+1 exists (the script only ever writes the *current*
+    week's HTML). So a ">" link to week N+1 can't be baked in at generation
+    time -- week N+1 doesn't exist yet when week N is generated. Instead the
+    footer ships empty nav slots plus a small script that runs client-side,
+    on every page load, and probes for week_{N-1}_report.html and
+    week_{N+1}_report.html sitting alongside this file. Whichever exist get
+    turned into links; whichever don't stay invisible. That means week N's
+    page automatically grows a working ">" link the moment week N+1's HTML
+    lands next to it (e.g. after a git push), with zero re-generation of
+    week N's own file -- the check happens fresh every time someone opens it.
+
+    Only checks the adjacent week within the same season folder (both files
+    live in the same directory by construction -- see html_path()), not
+    across a season boundary.
+    """
+    footer = (
+        f'<div class="footer">'
+        f'<span class="nav-prev" id="navPrev"></span>'
+        f'<span class="footer-text">Last updated {html.escape(generated_at)}</span>'
+        f'<span class="nav-next" id="navNext"></span>'
+        f'</div>'
+        f'<script>(function(){{'
+        f'var week={week},season={season};'
+        f'function tryLink(targetWeek,elId,isPrev){{'
+        f'if(targetWeek<0)return;'
+        f'var el=document.getElementById(elId);'
+        f'var href="week_"+targetWeek+"_report.html";'
+        f'fetch(href,{{cache:"no-store"}}).then(function(resp){{'
+        f'if(!resp.ok)return;'
+        f'var label="W"+targetWeek+" "+season;'
+        f'var a=document.createElement("a");'
+        f'a.href=href;'
+        f'a.textContent=isPrev?("< "+label):(label+" >");'
+        f'var sep=document.createElement("span");'
+        f'sep.className="sep";'
+        f'sep.textContent="|";'
+        f'if(isPrev){{el.appendChild(a);el.appendChild(sep);}}'
+        f'else{{el.appendChild(sep);el.appendChild(a);}}'
+        f'}}).catch(function(){{}});'
+        f'}}'
+        f'tryLink(week-1,"navPrev",true);'
+        f'tryLink(week+1,"navNext",false);'
+        f'}})();</script>'
+    )
     with open(path, "w") as f:
         f.write(f"<!doctype html><html><head><meta charset='utf-8'>"
                 f"<title>{html.escape(league_name)}</title><style>{CSS}</style>"
@@ -1066,7 +1119,7 @@ def main():
     ]
     os.makedirs(season_dir(season), exist_ok=True)
     paths.append(write_html(html_path(season, wk), league["name"], pages,
-                            generated_at))
+                            generated_at, wk, season))
     print("\nWrote:\n  " + "\n  ".join(paths))
 
 

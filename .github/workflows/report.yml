@@ -5,6 +5,10 @@ on:
     # Runs in UTC. GitHub doesn't guarantee exact timing under load,
     # especially at the top of the hour when everyone else's cron fires too.
     - cron: "43 * * * *"
+  push:
+    branches: [main]
+    paths:
+      - 'report.py'
   workflow_dispatch: {}   # lets you trigger it manually from the Actions tab
 
 # Stops overlapping runs from racing each other if one run is still going

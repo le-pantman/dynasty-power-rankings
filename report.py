@@ -900,7 +900,7 @@ def main():
             continue
         actual_wr = wins[r] / len(completed)
         allplay_wr = allplay_wins[r] / allplay_games[r]
-        luck[r] = (actual_wr - allplay_wr) / allplay_wr * 100.0
+        luck[r] = (actual_wr - allplay_wr) / allplay_wr * 10.0
 
     # --- expected win rate --------------------------------------------------
     roster_players = {r["roster_id"]: (r.get("players") or []) for r in rosters}

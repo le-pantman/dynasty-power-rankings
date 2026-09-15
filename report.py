@@ -24,6 +24,7 @@ import os
 import re
 import statistics
 import time
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -38,6 +39,12 @@ except ImportError:
 # ----------------------------------------------------------------------------
 
 LEAGUE_ID = "1375130525345275904"
+
+# Timezone the "Last updated" footer is shown in. Indianapolis and Detroit
+# are both in the US Eastern zone and observe DST identically, so either
+# name resolves to the same clock time -- this automatically shows EDT until
+# the DST rollback (Nov 2, 2026) and EST after, no manual switching needed.
+REPORT_TIMEZONE = "America/Detroit"
 
 # FantasyCalc league shape
 FC_PARAMS = {"numQbs": 1, "numTeams": 12, "ppr": 1}
@@ -314,6 +321,33 @@ def best_lineup(scores, positions, slots, waiver=None):
             total += best_pts
             remaining.discard(best_player)
     return total
+
+
+def player_age(player, as_of=None):
+    """
+    Precise fractional age for a player, e.g. 25.6 rather than 25.
+
+    Sleeper's player objects carry two separate age signals: a cached integer
+    `age` field (just floor(real age)) and a `birth_date` (YYYY-MM-DD). The
+    integer field is what the raw API hands you by default, but it silently
+    truncates the fractional year -- averaged across a ~20-man roster with
+    birthdays spread through the year, that truncation costs ~0.4-0.5 years
+    off the true average every time, which is why AGE AVG here used to run
+    consistently below what Sleeper's own app shows (their app computes from
+    birth_date, not the integer field). This prefers birth_date and only
+    falls back to the integer `age` for the rare player missing one.
+    """
+    as_of = as_of or datetime.date.today()
+    bd = player.get("birth_date")
+    if bd:
+        try:
+            y, m, d = (int(x) for x in bd.split("-")[:3])
+            born = datetime.date(y, m, d)
+            return (as_of - born).days / 365.25
+        except (ValueError, TypeError):
+            pass
+    age = player.get("age")
+    return float(age) if age else None
 
 
 def zscores(values):
@@ -619,16 +653,12 @@ def render_page(title, subtitle, cols, rows, prev_week, key_col, note):
         f'<div class="li"><b>{label} <span class="a">{ARROW[d]}</span></b>'
         f'<span>{html.escape(desc)}</span></div>' for label, d, desc in cols)
 
-    movement = (f"Row colour shows movement against week {prev_week}: "
-                "green climbed, red slid." if has_prev else
-                "")
-
     return f"""<div class="page"><div class="bar"></div>
 <div class="head"><h1>{html.escape(title)}</h1><div class="sub">{html.escape(subtitle)}</div></div>
 <table><thead><tr><th class="l">#</th><th class="l"></th><th class="l">Team</th>{th}</tr></thead>
 <tbody>{body}</tbody></table>
 <div class="legend"><h2>Legend &nbsp;&middot;&nbsp; {ARROW['up']} higher is better &nbsp;&middot;&nbsp; {ARROW['down']} lower is better</h2>{legend}</div>
-<div class="note">{movement} {html.escape(note)}</div></div>"""
+<div class="note">{html.escape(note)}</div></div>"""
 
 
 def write_html(path, league_name, pages, generated_at):
@@ -869,10 +899,17 @@ def main():
     dyn_diff = {r: value[r] - redraft_value[r] for r in rids}
 
     # --- age ----------------------------------------------------------------
+    today = datetime.date.today()
     age_avg = {}
     for r in rids:
-        ages = [players[p]["age"] for p in all_owned[r]
-                if p in players and players[p].get("age")]
+        ages = []
+        for p in all_owned[r]:
+            player = players.get(p)
+            if not player:
+                continue
+            a = player_age(player, today)
+            if a is not None:
+                ages.append(a)
         age_avg[r] = statistics.mean(ages) if ages else 0.0
 
     # --- draft capital ------------------------------------------------------
@@ -1012,9 +1049,9 @@ def main():
              write_csv(season, wk, "pwr", CURRENT_COLS, pwr_rows),
              write_csv(season, wk, "long", FUTURE_COLS, long_rows)]
 
-    now = datetime.datetime.now()
+    now = datetime.datetime.now(ZoneInfo(REPORT_TIMEZONE))
     stamp = now.strftime("%d %b %Y")
-    generated_at = now.strftime("%d %b %Y, %I:%M %p")
+    generated_at = now.strftime("%d %b %Y, %I:%M %p %Z")
     long_weights = ", ".join(f"{k}={v:+.2f}" for k, v in LONG_WEIGHTS.items())
     pages = [
         render_page(league["name"], f"Overall rankings | Week {wk} | {stamp}",

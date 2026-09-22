@@ -1,0 +1,12 @@
+record,team,username,opp_team,opp_username,season,week,end_season,end_week,value,player
+high_score,Luddy 3D Printers,brewing,,,2026,2,,,179.26,
+low_score,Optimus Slime,haymond,,,2026,2,,,65.12,
+mvp,Charley Biggs,skora,,,2026,2,,,42.5,Jaxon Smith-Njigba
+win_streak,Luddy 3D Printers,brewing,,,2026,1,2026,2,2,
+win_streak,KingSoladi,KingSoladi,,,2026,1,2026,2,2,
+win_streak,Charley Biggs,skora,,,2026,1,2026,2,2,
+loss_streak,20russellw,20russellw,,,2026,1,2026,2,2,
+loss_streak,jhenryy129,jhenryy129,,,2026,1,2026,2,2,
+loss_streak,Cozy Table,reaveskii,,,2026,1,2026,2,2,
+high_matchup,MorsetheSeaHorse,MorsetheSeaHorse,KingSoladi,KingSoladi,2026,1,,,318.3,
+low_matchup,Wright Dining Pasta,ctSQD,Optimus Slime,haymond,2026,2,,,162.16,

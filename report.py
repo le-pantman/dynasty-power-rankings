@@ -2,10 +2,11 @@
 """
 Sleeper dynasty league metrics (12-team, 1QB, PPR).
 
-Outputs three tables:
+Outputs four tables:
   1. Overall metrics          : PWR, LONG, OVERALL
   2. Current-season metrics   : VALUE, PF AVG, PF VAR, COACH, EXP WR, LUCK, PWR
   3. Future-season metrics    : AGE AVG, DYN, PICKS, LONG
+  4. All-time records leaderboard (persisted in reports/records.csv)
 
 The script refuses to run mid-week: it only ever reports on the most recently
 *completed* regular-season week (see week_state()/ESPN check below), and never
@@ -94,6 +95,31 @@ LONG_WEIGHTS = {
 # the sort order changes so they land last. Flip to False to turn it off.
 JOKE_LOSER_ENABLED = True
 JOKE_LOSER_USERNAME = "jamesminrow"
+
+# --- next-season pick valuation schedule ------------------------------------
+# How NEXT season's rookie picks are valued as the current season plays out
+# (later seasons' picks always use the generic round value):
+#   weeks 1 .. TIER_START-1      : generic round value ("2027 1st")
+#   weeks TIER_START .. SLOT_START-1 : early/mid/late band ("2027 Early 1st"),
+#                                  from the ORIGINAL owner's max-PF rank
+#   weeks SLOT_START ..          : exact slot ("2027 1.01"), same ranking
+# Draft order = ascending max PF (lowest max PF picks first), linear in every
+# round. If FantasyCalc doesn't publish the finer-grained value, it falls
+# back to the next coarser one and prints a debug line saying so.
+PICK_TIER_START_WEEK = 5
+PICK_SLOT_START_WEEK = 11
+
+# --- leaderboard / all-time records ------------------------------------------
+# Persistent across seasons; re-read and re-merged every run (idempotent, so
+# the hourly re-runs of the same week never double-count anything).
+RECORDS_CSV = "records.csv"          # lives directly under OUTPUT_DIR
+
+# --- team icons ---------------------------------------------------------------
+# Folder of icon images plus a CSV of "username,iconfilename.png" lines. A
+# username can appear on several lines to get several icons. Shown only in
+# the ranking tables, not the leaderboard.
+ICONS_DIR = "icons"                   # folder under OUTPUT_DIR
+ICONS_CSV = "icons.csv"
 
 # Which bench positions can cover which starting slot.
 FLEX_ELIGIBILITY = {
@@ -369,32 +395,90 @@ def scale_0_100(values):
     return [100.0 * (v - lo) / (hi - lo) for v in values]
 
 
-PICK_RE = re.compile(
-    r"^(20\d\d)\s+(?:(early|mid|late)\s+)?(\d)(?:st|nd|rd|th)", re.IGNORECASE)
+PICK_ROUND_RE = re.compile(
+    r"^(20\d\d)\s+(?:(early|mid|late)\s+)?(\d)(?:st|nd|rd|th)\b", re.IGNORECASE)
+PICK_SLOT_RE = re.compile(
+    r"^(20\d\d)\s+(?:pick\s+)?(\d)\.(\d{1,2})\b", re.IGNORECASE)
 
 
 def parse_pick_values(fc_rows):
     """
-    Pull draft-pick entries out of the FantasyCalc list.
+    Pull draft-pick entries out of the FantasyCalc list, keeping each level of
+    granularity separate so the valuation schedule can pick the right one:
 
-    FantasyCalc mixes picks in with players, named like "2027 1st" or
-    "2027 Mid 2nd". We average across early/mid/late since future pick slots
-    are unknown. Returns {(season:int, round:int): value:float}.
+      {(season, round): {"round": value or None,          # "2027 1st"
+                         "tiers": {"early": v, ...},      # "2027 Early 1st"
+                         "slots": {1: v, 2: v, ...}}}     # "2027 1.01" / "2027 Pick 1.01"
+
+    "round" falls back to the mean of whatever finer rows exist when there's
+    no generic row, so the week 1-4 behaviour never comes up empty.
     """
-    buckets = {}
+    out = {}
+
+    def entry(season, rnd):
+        return out.setdefault((season, rnd), {"round": None, "tiers": {},
+                                              "slots": {}, "_all": []})
+
     for row in fc_rows:
-        name = (row.get("player") or {}).get("name", "")
-        m = PICK_RE.match(name.strip())
-        if not m:
+        name = ((row.get("player") or {}).get("name") or "").strip()
+        value = float(row["value"])
+        m = PICK_SLOT_RE.match(name)
+        if m:
+            e = entry(int(m.group(1)), int(m.group(2)))
+            e["slots"][int(m.group(3))] = value
+            e["_all"].append(value)
             continue
-        season, _tier, rnd = int(m.group(1)), m.group(2), int(m.group(3))
-        buckets.setdefault((season, rnd), []).append(float(row["value"]))
-    return {k: statistics.mean(v) for k, v in buckets.items()}
+        m = PICK_ROUND_RE.match(name)
+        if m:
+            e = entry(int(m.group(1)), int(m.group(3)))
+            tier = (m.group(2) or "").lower()
+            if tier:
+                e["tiers"][tier] = value
+            else:
+                e["round"] = value
+            e["_all"].append(value)
+
+    for e in out.values():
+        if e["round"] is None and e["_all"]:
+            e["round"] = statistics.mean(e["_all"])
+        del e["_all"]
+    return out
+
+
+def pick_tier(slot, num_teams):
+    """Draft slot (1-based) -> 'early' / 'mid' / 'late' by thirds of the round."""
+    third = num_teams / 3.0
+    if slot <= third:
+        return "early"
+    if slot <= 2 * third:
+        return "mid"
+    return "late"
+
+
+def pick_value(pick_values, season, rnd, slot, mode, num_teams):
+    """
+    Value of one pick under the requested granularity ('round' / 'tier' /
+    'slot'), falling back to coarser levels when FantasyCalc doesn't publish
+    the finer one. Returns (value, level_actually_used); value is None if
+    FantasyCalc has nothing at all for that season+round.
+    """
+    e = pick_values.get((season, rnd))
+    if not e:
+        return None, None
+    if mode == "slot" and slot in e["slots"]:
+        return e["slots"][slot], "slot"
+    if mode in ("slot", "tier"):
+        t = pick_tier(slot, num_teams)
+        if t in e["tiers"]:
+            return e["tiers"][t], "tier"
+    return e["round"], "round"
 
 
 def owned_picks(rosters, traded_picks, seasons, rounds):
     """
-    {roster_id: [(season, round), ...]} of future picks actually owned.
+    {roster_id: [(season, round, original_roster_id), ...]} of future picks
+    actually owned. original_roster_id is whose pick it was to begin with --
+    that team's standing is what decides where the pick lands in the draft.
 
     Every roster starts owning its own picks. A pick can change hands more than
     once and the endpoint isn't guaranteed to be in chronological order, so we
@@ -425,9 +509,9 @@ def owned_picks(rosters, traded_picks, seasons, rounds):
         current[key] = owner
 
     out = {rid: [] for rid in rids}
-    for (season, rnd, _orig), owner in current.items():
+    for (season, rnd, orig), owner in current.items():
         if owner in out:
-            out[owner].append((season, rnd))
+            out[owner].append((season, rnd, orig))
     return out
 
 
@@ -448,6 +532,40 @@ def find_roster_id_by_username(rosters, users, username):
         if target in (handle, display):
             return r["roster_id"]
     return None
+
+
+def load_team_icons(season):
+    """
+    {lowercased username: [relative image src, ...]} from
+    OUTPUT_DIR/ICONS_DIR/ICONS_CSV, whose lines look like
+    "username,iconfilename.png". Several lines per username = several icons,
+    shown in file order. Blank lines, '#' comments and a "username,..."
+    header line are skipped; icons whose file is missing are skipped with a
+    debug line rather than rendered as broken images.
+
+    The src is relative to the season folder the report HTML is written to
+    (e.g. "../icons/crown.png"), so it resolves both locally and on Pages.
+    """
+    icons_dir = os.path.join(OUTPUT_DIR, ICONS_DIR)
+    csv_file = os.path.join(icons_dir, ICONS_CSV)
+    out = {}
+    if not os.path.exists(csv_file):
+        return out
+    with open(csv_file, newline="", encoding="utf-8") as f:
+        for row in csv.reader(f):
+            if len(row) < 2:
+                continue
+            user, fname = row[0].strip(), row[1].strip()
+            if not user or user.startswith("#") or user.lower() == "username":
+                continue
+            path = os.path.join(icons_dir, fname)
+            if not os.path.exists(path):
+                print(f"  [debug] icon {fname!r} for {user!r} not found in "
+                      f"{icons_dir}; skipping")
+                continue
+            rel = os.path.relpath(path, season_dir(season)).replace(os.sep, "/")
+            out.setdefault(user.lower(), []).append(rel)
+    return out
 
 
 def _extreme_teams_by_column(rows, cols, key_col, best):
@@ -479,10 +597,167 @@ def best_teams_by_column(rows, cols, key_col):
 
 
 def worst_teams_by_column(rows, cols, key_col):
-    """Italicized in the report. See _extreme_teams_by_column. Note a team
+    """Greyed out in the report. See _extreme_teams_by_column. Note a team
     can be both best and worst in a column (e.g. only one row has data for
-    it) -- that's not a bug, it just gets bold+italic."""
+    it) -- that's not a bug, it just gets bold+grey."""
     return _extreme_teams_by_column(rows, cols, key_col, best=False)
+
+
+# ----------------------------------------------------------------------------
+# All-time records / leaderboard
+# ----------------------------------------------------------------------------
+
+# (key, label, which extreme wins, good-or-bad record, kind)
+RECORD_DEFS = [
+    ("high_score",   "Highest Week Score",      "max", True,  "score"),
+    ("low_score",    "Lowest Week Score",       "min", False, "score"),
+    ("mvp",          "MVP (Top Starter)",       "max", True,  "mvp"),
+    ("win_streak",   "Longest Win Streak",      "max", True,  "streak"),
+    ("loss_streak",  "Longest Losing Streak",   "max", False, "streak"),
+    ("high_matchup", "Highest Scoring Matchup", "max", True,  "matchup"),
+    ("low_matchup",  "Lowest Scoring Matchup",  "min", False, "matchup"),
+]
+RECORD_FIELDS = ["record", "team", "username", "opp_team", "opp_username",
+                 "season", "week", "end_season", "end_week", "value", "player"]
+
+
+def records_path():
+    return os.path.join(OUTPUT_DIR, RECORDS_CSV)
+
+
+def load_records(path):
+    rows = []
+    if not os.path.exists(path):
+        return rows
+    with open(path, newline="", encoding="utf-8") as f:
+        for r in csv.DictReader(f):
+            if not (r.get("record") or "").strip():
+                continue
+            row = {k: (r.get(k) or "").strip() for k in RECORD_FIELDS}
+            row["season"] = int(row["season"])
+            row["week"] = int(row["week"])
+            row["end_season"] = int(row["end_season"]) if row["end_season"] else None
+            row["end_week"] = int(row["end_week"]) if row["end_week"] else None
+            row["value"] = float(row["value"])
+            rows.append(row)
+    return rows
+
+
+def save_records(path, rows):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    order = {d[0]: i for i, d in enumerate(RECORD_DEFS)}
+    rows = sorted(rows, key=lambda r: (order.get(r["record"], 99),
+                                       r["season"], r["week"],
+                                       r["username"].lower()))
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=RECORD_FIELDS, lineterminator="\n")
+        w.writeheader()
+        for r in rows:
+            out = dict(r)
+            out["value"] = f"{round(r['value'], 2):g}"
+            out["end_season"] = "" if r["end_season"] is None else r["end_season"]
+            out["end_week"] = "" if r["end_week"] is None else r["end_week"]
+            w.writerow(out)
+
+
+def merge_records(existing, candidates, canon=lambda h: h.lower()):
+    """
+    Combine stored records with this run's candidates, keeping, per record
+    type, every row tied for the best value.
+
+    Idempotent by design -- the script re-runs every hour for the same week,
+    and candidates are recomputed from ALL completed weeks each time -- so
+    each row has an identity (who + when + what), and a candidate matching
+    an existing identity never adds a second row. The one exception is a
+    streak, identified by its start: a longer candidate with the same start
+    is that same streak having been extended, so it replaces the stored one
+    (keeping the stored team name). `canon` maps a username/display name to
+    a stable id, so a record typed with a display name still matches a
+    candidate built from the username.
+    """
+    kinds = {d[0]: d[4] for d in RECORD_DEFS}
+    extreme = {d[0]: d[2] for d in RECORD_DEFS}
+
+    def ident(r):
+        k = kinds[r["record"]]
+        who = canon(r["username"])
+        if k == "matchup":
+            who = frozenset([who, canon(r["opp_username"])])
+        base = (r["record"], r["season"], r["week"], who)
+        if k == "mvp":
+            return base + (r["player"].lower(),)
+        return base
+
+    pool = {}
+    for r in existing:
+        if r["record"] in kinds:
+            pool[ident(r)] = dict(r)
+    for c in candidates:
+        key = ident(c)
+        if key not in pool:
+            pool[key] = dict(c)
+        elif kinds[c["record"]] == "streak" and c["value"] > pool[key]["value"]:
+            kept_name = pool[key]["team"]
+            pool[key] = dict(c, team=kept_name)
+
+    merged = []
+    for rec, _label, ext, _good, _kind in RECORD_DEFS:
+        rows = [r for r in pool.values() if r["record"] == rec]
+        if not rows:
+            continue
+        best = (max if ext == "max" else min)(round(r["value"], 2) for r in rows)
+        merged += [r for r in rows if round(r["value"], 2) == best]
+    return merged
+
+
+def record_is_new(row, season, week):
+    """True if this record was set (or a streak extended) in this week."""
+    if row["end_season"] is not None:
+        return (row["end_season"], row["end_week"]) == (season, week)
+    return (row["season"], row["week"]) == (season, week)
+
+
+def render_leaderboard(title, subtitle, records, season, week):
+    def who(team, user):
+        return (f'{html.escape(team)} <span class="lb-user">'
+                f'({html.escape(user)})</span>')
+
+    body = ""
+    for rec, label, _ext, good, kind in RECORD_DEFS:
+        rows = sorted((r for r in records if r["record"] == rec),
+                      key=lambda r: (r["season"], r["week"], r["team"].lower()))
+        if not rows:
+            body += (f'<tr><td class="lb-rec">{label}</td>'
+                     f'<td colspan="3" class="lb-empty">&mdash;</td></tr>')
+            continue
+        for i, r in enumerate(rows):
+            if kind == "matchup":
+                team = (f'{who(r["team"], r["username"])}<br>'
+                        f'<span class="lb-vs">vs</span> '
+                        f'{who(r["opp_team"], r["opp_username"])}')
+            else:
+                team = who(r["team"], r["username"])
+            when = f'W{r["week"]} {r["season"]}'
+            if kind == "streak":
+                when += f' &ndash; W{r["end_week"]} {r["end_season"]}'
+                value = f'{int(r["value"])}{"W" if rec == "win_streak" else "L"}'
+            elif kind == "mvp":
+                value = f'{html.escape(r["player"])}, {r["value"]:.2f} pts'
+            else:
+                value = f'{r["value"]:.2f} pts'
+            cls = ""
+            if record_is_new(r, season, week):
+                cls = " lb-new-good" if good else " lb-new-bad"
+            label_cell = (f'<td class="lb-rec" rowspan="{len(rows)}">{label}</td>'
+                          if i == 0 else "")
+            body += (f'<tr>{label_cell}<td class="lb-team{cls}">{team}</td>'
+                     f'<td class="lb-when{cls}">{when}</td>'
+                     f'<td class="lb-val{cls}">{value}</td></tr>')
+
+    return f"""<div class="page"><div class="bar"></div>
+<div class="head"><h1>{html.escape(title)}</h1><div class="sub">{html.escape(subtitle)}</div></div>
+<table class="lb"><thead><tr><th class="l">Record</th><th class="l">Team</th><th class="l">When</th><th>Value</th></tr></thead>
+<tbody>{body}</tbody></table></div>"""
 
 
 def season_dir(season):
@@ -598,6 +873,9 @@ tbody tr:last-child td{border-bottom:none}
 td.rank{width:38px;text-align:center;font-weight:800;color:#6b7280;font-size:12.5px}
 td.mv{width:42px;text-align:left;padding-left:0}
 td.team{text-align:left;font-weight:650;letter-spacing:-.2px}
+.ticon{height:1.15em;width:auto;vertical-align:middle;display:inline-block;
+margin:-0.4em 0 -0.4em 5px}
+.ticon+.ticon{margin-left:2px}
 td.key{font-weight:800}
 td.best{font-weight:800}
 .worst{color:#9ca3af}
@@ -612,6 +890,19 @@ color:#6b7280;margin-bottom:11px;font-weight:700}
 .li .a{font-size:7.5px;color:#9aa1ac}
 .note{padding:11px 26px 16px;font-size:10.5px;color:#8b919c;line-height:1.5;
 background:#fafbfc}
+table.lb tbody td{font-size:15px;padding:14px 14px;text-align:left}
+table.lb thead th{padding:12px 14px}
+table.lb td.lb-val{text-align:right;font-weight:700;white-space:nowrap}
+table.lb td.lb-when{white-space:nowrap;color:#4b5563}
+table.lb td.lb-rec{font-weight:800;vertical-align:top;width:210px;
+background:#fafbfc;border-right:1px solid #eef0f3}
+table.lb tbody tr:last-child td{border-bottom:none}
+table.lb td.lb-rec{border-bottom:1px solid #eef0f3}
+.lb-user{color:#6b7280;font-size:.85em;font-weight:500}
+.lb-empty{color:#c2c7d0;text-align:center}
+.lb-vs{color:#9ca3af;font-size:.85em}
+td.lb-new-good{background:rgba(22,163,74,.16)}
+td.lb-new-bad{background:rgba(220,38,38,.14)}
 .footer{max-width:940px;margin:0 auto 26px;display:flex;align-items:center;
 font-size:11px;color:#9ca1ac}
 .footer .nav-prev{flex:1 1 0;text-align:right}
@@ -624,6 +915,14 @@ font-size:11px;color:#9ca1ac}
 .page{box-shadow:none;margin:0;page-break-after:always;border-radius:0}
 .footer{display:none}}
 """
+
+
+def icon_html(row):
+    """Emoji-sized inline images after the team name (empty if none)."""
+    return "".join(
+        f'<img class="ticon" src="{html.escape(src)}" alt="" '
+        f'title="{html.escape(row.get("owner") or "")}">'
+        for src in row.get("icons") or [])
 
 
 def render_page(title, subtitle, cols, rows, prev_week, key_col, note):
@@ -652,7 +951,8 @@ def render_page(title, subtitle, cols, rows, prev_week, key_col, note):
         body += (f'<tr style="background:{row_tint(r["delta"])}">'
                  f'<td class="rank">{r["rank"]}</td>'
                  f'<td class="mv">{delta_badge(r["delta"], has_prev)}</td>'
-                 f'<td class="team">{html.escape(r["team"])}</td>{cells}</tr>')
+                 f'<td class="team">{html.escape(r["team"])}{icon_html(r)}</td>'
+                 f'{cells}</tr>')
 
     legend = "".join(
         f'<div class="li"><b>{label} <span class="a">{ARROW[d]}</span></b>'
@@ -768,6 +1068,26 @@ def main():
 
     names = {r["roster_id"]: team_name(r) for r in rosters}
     owners = {r["roster_id"]: owner_of(r) for r in rosters}
+
+    # Every handle a roster's owner could be referred to by (username and
+    # display name, lowercased) -- used to match icons.csv and records.csv
+    # entries regardless of which one was typed.
+    handles = {}
+    for r in rosters:
+        u = users.get(r["owner_id"], {})
+        handles[r["roster_id"]] = {h.strip().lower() for h in
+                                   (u.get("username"), u.get("display_name"))
+                                   if h}
+
+    team_icons = load_team_icons(season)
+
+    def icons_for(rid):
+        out = []
+        for h in sorted(handles[rid]):
+            for src in team_icons.get(h, []):
+                if src not in out:
+                    out.append(src)
+        return out
     rids = [r["roster_id"] for r in rosters]
     pos_of = {pid: (p.get("fantasy_positions") or [p.get("position")])[0]
               for pid, p in players.items() if p.get("position")}
@@ -902,6 +1222,85 @@ def main():
         allplay_wr = allplay_wins[r] / allplay_games[r]
         luck[r] = (actual_wr - allplay_wr) / allplay_wr * 10.0
 
+    # --- record candidates ---------------------------------------------------
+    # Rebuilt from EVERY completed week each run and merged into the stored
+    # records (see merge_records) -- that's what keeps the hourly re-runs
+    # idempotent and lets a missed run heal itself on the next one.
+    # Streaks only look within this season: each Sleeper season is a new
+    # league_id, so a streak can't be followed across the offseason.
+    def player_name(pid):
+        p = players.get(pid) or {}
+        return (p.get("full_name") or
+                " ".join(x for x in (p.get("first_name"), p.get("last_name")) if x)
+                or str(pid))
+
+    def cand(rec, rid, wk_, value, **extra):
+        row = {"record": rec, "team": names[rid], "username": owners[rid],
+               "opp_team": "", "opp_username": "", "season": season,
+               "week": wk_, "end_season": None, "end_week": None,
+               "value": round(float(value), 2), "player": ""}
+        row.update(extra)
+        return row
+
+    record_cands = []
+    results = {rid: {} for rid in rids}      # rid -> {week: 'W'/'L'/'T'}
+    for wk_ in completed:
+        ms = matchups_by_week[wk_]
+        pts = {m["roster_id"]: (m.get("points") or 0.0) for m in ms}
+        for m in ms:
+            rid = m["roster_id"]
+            if rid not in names:
+                continue
+            record_cands.append(cand("high_score", rid, wk_, pts[rid]))
+            record_cands.append(cand("low_score", rid, wk_, pts[rid]))
+            starters = m.get("starters") or []
+            spts = m.get("starters_points") or []
+            pp = m.get("players_points") or {}
+            scored = []
+            for i, pid in enumerate(starters):
+                if not pid or pid == "0":          # "0" = empty lineup slot
+                    continue
+                v = spts[i] if i < len(spts) else pp.get(pid)
+                if v is not None:
+                    scored.append((round(float(v), 2), pid))
+            if scored:
+                top = max(v for v, _ in scored)
+                for v, pid in scored:
+                    if v == top:
+                        record_cands.append(cand("mvp", rid, wk_, v,
+                                                 player=player_name(pid)))
+        by_matchup = {}
+        for m in ms:
+            if m.get("matchup_id") is not None:
+                by_matchup.setdefault(m["matchup_id"], []).append(m["roster_id"])
+        for pair in by_matchup.values():
+            if len(pair) != 2 or not all(p in names for p in pair):
+                continue
+            a, b = sorted(pair)
+            total = pts[a] + pts[b]
+            for rec in ("high_matchup", "low_matchup"):
+                record_cands.append(cand(rec, a, wk_, total,
+                                         opp_team=names[b],
+                                         opp_username=owners[b]))
+            results[a][wk_] = "W" if pts[a] > pts[b] else "L" if pts[a] < pts[b] else "T"
+            results[b][wk_] = "W" if pts[b] > pts[a] else "L" if pts[b] < pts[a] else "T"
+
+    for rid in rids:
+        for outcome, rec in (("W", "win_streak"), ("L", "loss_streak")):
+            run_start, run_len, prev_wk = None, 0, None
+            for wk_ in completed + [None]:          # sentinel flushes last run
+                hit = wk_ is not None and results[rid].get(wk_) == outcome
+                if hit:
+                    if run_len == 0:
+                        run_start = wk_
+                    run_len += 1
+                    prev_wk = wk_
+                elif run_len:
+                    record_cands.append(cand(rec, rid, run_start, run_len,
+                                             end_season=season,
+                                             end_week=prev_wk))
+                    run_len = 0
+
     # --- expected win rate --------------------------------------------------
     roster_players = {r["roster_id"]: (r.get("players") or []) for r in rosters}
     rostered = {p for ps in roster_players.values() for p in ps}
@@ -996,16 +1395,42 @@ def main():
     traded = sleeper(f"/league/{LEAGUE_ID}/traded_picks")
     holdings = owned_picks(rosters, traded, set(seasons), rounds)
 
+    # Next season's picks get progressively more specific as the season
+    # plays out (see PICK_TIER_START_WEEK / PICK_SLOT_START_WEEK). Projected
+    # draft slot = rank by season max PF (sum of optimal lineups), lowest
+    # first; ties broken by actual PF, then roster_id, so the order is stable.
+    n_done = len(completed)
+    if n_done >= PICK_SLOT_START_WEEK:
+        next_mode = "slot"
+    elif n_done >= PICK_TIER_START_WEEK:
+        next_mode = "tier"
+    else:
+        next_mode = "round"
+    max_pf = {r: sum(optimal[r]) for r in rids}
+    draft_order = sorted(rids, key=lambda r: (max_pf[r], sum(weekly[r]), r))
+    proj_slot = {r: i + 1 for i, r in enumerate(draft_order)}
+    num_teams = len(rids)
+
     picks = {}
     missing = set()
+    fallbacks = set()
     for rid in rids:
         total = 0.0
-        for (s, rnd) in holdings.get(rid, []):
-            if (s, rnd) in pick_values:
-                total += pick_values[(s, rnd)]
-            else:
+        for (s, rnd, orig) in holdings.get(rid, []):
+            mode = next_mode if s == season + 1 else "round"
+            v, used = pick_value(pick_values, s, rnd, proj_slot[orig],
+                                 mode, num_teams)
+            if v is None:
                 missing.add((s, rnd))
+                continue
+            if used != mode:
+                fallbacks.add((s, rnd, mode, used))
+            total += v
         picks[rid] = total
+    print(f"  Next-season ({season + 1}) picks valued by: {next_mode}")
+    for (s, rnd, want, got) in sorted(fallbacks):
+        print(f"  [debug] FantasyCalc has no {want}-level value for some "
+              f"{s} round-{rnd} picks; used {got}-level instead")
     unexpected = {(s, r) for (s, r) in missing
                   if valued_rounds and r <= max(valued_rounds)}
     if unexpected:
@@ -1084,6 +1509,7 @@ def main():
             if prev is None:
                 prev = by_name.get(names[r])
             rows.append({"team": names[r], "roster_id": r, "owner": owners[r],
+                         "icons": icons_for(r),
                          "rank": rank, "raw": raws[r],
                          "disp": disp, "delta": (prev - rank) if prev else 0})
         return prev_week, rows
@@ -1136,6 +1562,20 @@ def main():
                     FUTURE_COLS, long_rows, long_prev, "LONG",
                     f"LONG weighting: {long_weights}."),
     ]
+    # --- all-time records ----------------------------------------------------
+    handle_to_rid = {h: rid for rid, hs in handles.items() for h in hs}
+
+    def canon(h):
+        h = (h or "").strip().lower()
+        return f"rid:{handle_to_rid[h]}" if h in handle_to_rid else h
+
+    records = merge_records(load_records(records_path()), record_cands, canon)
+    save_records(records_path(), records)
+    paths.append(records_path())
+    pages.append(render_leaderboard(league["name"],
+                                    f"All-time records | Week {wk} | {stamp}",
+                                    records, season, wk))
+
     os.makedirs(season_dir(season), exist_ok=True)
     paths.append(write_html(html_path(season, wk), league["name"], pages,
                             generated_at, wk, season))

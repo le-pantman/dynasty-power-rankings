@@ -24,7 +24,6 @@ import math
 import os
 import re
 import statistics
-import time
 from zoneinfo import ZoneInfo
 
 import requests
@@ -58,9 +57,6 @@ REGULAR_SEASON_WEEKS = 14  # fallback; overridden by league playoff_week_start
 # Also acts as a hard safety cap independent of whatever the league's own
 # playoff_week_start setting says.
 POSTSEASON_START_WEEK = 15
-
-CACHE_DIR = ".cache"
-CACHE_TTL = 60 * 60 * 12   # 12h -- player map is ~5MB, don't refetch constantly
 
 # Which future rookie-draft seasons to count toward PICKS.
 # None = auto (the 3 seasons after the current one).
@@ -113,6 +109,21 @@ PICK_SLOT_START_WEEK = 11
 # Persistent across seasons; re-read and re-merged every run (idempotent, so
 # the hourly re-runs of the same week never double-count anything).
 RECORDS_CSV = "records.csv"          # lives directly under OUTPUT_DIR
+
+# Win/loss streaks are computed over each owner's COMPLETE game history:
+# every prior season (followed back through Sleeper's previous_league_id
+# chain), including playoff games, then into the current season. Owners are
+# matched by Sleeper user_id, which survives renames and season rollovers.
+#   STREAKS_INCLUDE_PLAYOFFS : count winners-bracket games (incl. placement
+#                              games like 3rd place). A week with no game
+#                              (playoff bye, missed playoffs, offseason)
+#                              neither extends nor breaks a streak.
+#   STREAKS_INCLUDE_CONSOLATION : also count losers-bracket games. Off by
+#                              default -- in toilet-bowl formats the bracket
+#                              "winner" can be the team that lost.
+STREAKS_INCLUDE_PLAYOFFS = True
+STREAKS_INCLUDE_CONSOLATION = False
+MAX_HISTORY_SEASONS = 50             # safety cap on the previous_league_id walk
 
 # --- team icons ---------------------------------------------------------------
 # Folder of icon images plus a CSV of "username,iconfilename.png" lines. A
@@ -176,25 +187,13 @@ ARROW = {"up": "&#9650;", "down": "&#9660;"}
 # HTTP helpers
 # ----------------------------------------------------------------------------
 
-def get_json(url, params=None, cache_key=None, headers=None):
-    """GET with optional on-disk cache. Raises loudly so failures are obvious."""
-    if cache_key:
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        path = os.path.join(CACHE_DIR, cache_key + ".json")
-        if os.path.exists(path) and time.time() - os.path.getmtime(path) < CACHE_TTL:
-            with open(path) as f:
-                return json.load(f)
-
+def get_json(url, params=None, headers=None):
+    """GET, always live (no caching). Raises loudly so failures are obvious."""
     r = requests.get(url, params=params, timeout=30,
                      headers=headers or {"User-Agent": "league-metrics/1.0"})
     if r.status_code != 200:
         raise RuntimeError(f"{r.status_code} from {r.url}")
-    data = r.json()
-
-    if cache_key:
-        with open(path, "w") as f:
-            json.dump(data, f)
-    return data
+    return r.json()
 
 
 def sleeper(path):
@@ -204,8 +203,7 @@ def sleeper(path):
 def fantasycalc(is_dynasty):
     """FantasyCalc trade values. Returns the raw list of value entries."""
     params = dict(FC_PARAMS, isDynasty=str(bool(is_dynasty)).lower())
-    return get_json("https://api.fantasycalc.com/values/current", params=params,
-                    cache_key=f"fc_{'dyn' if is_dynasty else 'redraft'}")
+    return get_json("https://api.fantasycalc.com/values/current", params=params)
 
 
 def week_projections(season, week):
@@ -214,7 +212,7 @@ def week_projections(season, week):
     params = [("season_type", "regular"), ("order_by", "ppr")]
     for pos in ("QB", "RB", "WR", "TE", "K", "DEF"):
         params.append(("position[]", pos))
-    rows = get_json(url, params=params, cache_key=f"proj_{season}_{week}")
+    rows = get_json(url, params=params)
     out = {}
     for row in rows:
         pts = (row.get("stats") or {}).get("pts_ppr")
@@ -257,7 +255,7 @@ def espn_game_statuses(season, week, seasontype=2):
     Sleeper's own /state/nfl only exposes a single "current week" counter with
     no notion of whether that week's games have actually kicked off or wrapped
     up, so this is what we lean on to tell "week in progress" apart from
-    "week is over". Never cached -- the whole point is a live read at run time.
+    "week is over".
     """
     url = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
     params = {"seasontype": seasontype, "week": week, "year": season}
@@ -604,6 +602,139 @@ def worst_teams_by_column(rows, cols, key_col):
 
 
 # ----------------------------------------------------------------------------
+# Game history (for streaks that run through playoffs and across seasons)
+# ----------------------------------------------------------------------------
+
+def playoff_round_week(settings, rnd, n_rounds):
+    """
+    Last NFL week of playoff round `rnd` (1-based). Sleeper's
+    playoff_round_type: 0 = one week per round, 1 = two-week championship
+    round only, 2 = two weeks per round.
+    """
+    start = settings.get("playoff_week_start") or (REGULAR_SEASON_WEEKS + 1)
+    rtype = settings.get("playoff_round_type") or 0
+    if rtype == 2:
+        return start + 2 * rnd - 1
+    if rtype == 1 and rnd == n_rounds:
+        return start + rnd
+    return start + rnd - 1
+
+
+def season_game_log(season, settings, owner_of_roster, matchups_by_week,
+                    winners=None, losers=None):
+    """
+    [(season, week, user_id, 'W'/'L'/'T'), ...] for one league-season.
+
+    Regular season from the weekly matchups (a week only counts if points
+    were actually scored); playoffs from the bracket endpoints, whose w/l
+    fields are only filled in once a game is final. Rosters with no owner
+    (orphans) are skipped -- a streak belongs to a person, not a slot.
+    """
+    out = []
+    for wk in sorted(matchups_by_week):
+        ms = matchups_by_week[wk] or []
+        if not ms or sum((m.get("points") or 0) for m in ms) <= 0:
+            continue
+        pts = {m["roster_id"]: (m.get("points") or 0.0) for m in ms}
+        pairs = {}
+        for m in ms:
+            if m.get("matchup_id") is not None:
+                pairs.setdefault(m["matchup_id"], []).append(m["roster_id"])
+        for pair in pairs.values():
+            if len(pair) != 2:
+                continue
+            a, b = pair
+            for x, y in ((a, b), (b, a)):
+                uid = owner_of_roster.get(x)
+                if uid:
+                    res = "W" if pts[x] > pts[y] else "L" if pts[x] < pts[y] else "T"
+                    out.append((season, wk, uid, res))
+
+    for bracket in (winners, losers):
+        if not bracket:
+            continue
+        n_rounds = max((g.get("r") or 0) for g in bracket)
+        for g in bracket:
+            w, l = g.get("w"), g.get("l")
+            if not w or not l:                     # not played yet / bye
+                continue
+            wk = playoff_round_week(settings, g.get("r") or 1, n_rounds)
+            for rid, res in ((w, "W"), (l, "L")):
+                uid = owner_of_roster.get(rid)
+                if uid:
+                    out.append((season, wk, uid, res))
+    return out
+
+
+def streak_runs(games):
+    """
+    {user_id: [(outcome, length, (start_season, start_week),
+                (end_season, end_week)), ...]}
+    over the full chronological log. Only games played count: a week with
+    no game is simply skipped, so a playoff bye or the offseason doesn't
+    break a streak. A tie breaks both kinds.
+    """
+    by_user = {}
+    for season, wk, uid, res in games:
+        by_user.setdefault(uid, {})[(season, wk)] = res   # dedupe same week
+    runs = {}
+    for uid, log in by_user.items():
+        cur, length, start, end = None, 0, None, None
+        out = []
+        for key in sorted(log):
+            res = log[key]
+            if res == cur and res in ("W", "L"):
+                length += 1
+                end = key
+            else:
+                if cur in ("W", "L"):
+                    out.append((cur, length, start, end))
+                cur, length, start, end = res, 1, key, key
+        if cur in ("W", "L"):
+            out.append((cur, length, start, end))
+        runs[uid] = out
+    return runs
+
+
+def previous_leagues(league):
+    """Prior seasons' league objects, oldest first, via previous_league_id."""
+    chain, seen = [], set()
+    lid = league.get("previous_league_id")
+    while lid and lid != "0" and lid not in seen and len(chain) < MAX_HISTORY_SEASONS:
+        seen.add(lid)
+        lg = sleeper(f"/league/{lid}")
+        if not lg:
+            break
+        chain.append(lg)
+        lid = lg.get("previous_league_id")
+    return list(reversed(chain))
+
+
+def past_season_games(lg):
+    """(game log, {user_id: (team_name, handle)}) for a finished season."""
+    lid = lg["league_id"]
+    season = int(lg["season"])
+    settings = lg.get("settings") or {}
+    rosters = sleeper(f"/league/{lid}/rosters")
+    users = sleeper(f"/league/{lid}/users")
+    owner = {r["roster_id"]: r.get("owner_id") for r in rosters}
+    info = {}
+    for u in users:
+        info[u["user_id"]] = ((u.get("metadata") or {}).get("team_name")
+                              or u.get("display_name") or u["user_id"],
+                              u.get("username") or u.get("display_name") or "")
+    reg = (settings.get("playoff_week_start") or (REGULAR_SEASON_WEEKS + 1)) - 1
+    mbw = {wk: sleeper(f"/league/{lid}/matchups/{wk}")
+           for wk in range(1, reg + 1)}
+    winners = losers = None
+    if STREAKS_INCLUDE_PLAYOFFS:
+        winners = sleeper(f"/league/{lid}/winners_bracket")
+        if STREAKS_INCLUDE_CONSOLATION:
+            losers = sleeper(f"/league/{lid}/losers_bracket")
+    return season_game_log(season, settings, owner, mbw, winners, losers), info
+
+
+# ----------------------------------------------------------------------------
 # All-time records / leaderboard
 # ----------------------------------------------------------------------------
 
@@ -865,6 +996,7 @@ table{width:100%;border-collapse:collapse}
 thead th{background:#12141a;color:#fff;font-size:10.5px;font-weight:700;
 text-transform:uppercase;letter-spacing:.8px;padding:11px 10px;text-align:right;
 white-space:nowrap}
+thead tr{background:#12141a}
 thead th.l{text-align:left}
 thead th .dir{font-size:7.5px;margin-left:4px;opacity:.75;vertical-align:middle}
 tbody td{padding:11px 10px;font-size:13.5px;text-align:right;
@@ -911,9 +1043,16 @@ font-size:11px;color:#9ca1ac}
 .footer .nav-prev a:hover,.footer .nav-next a:hover{color:#12141a}
 .footer .sep{margin:0 8px;color:#d1d5db}
 .footer-text{flex:0 0 auto;padding:0 4px}
+.footer{margin-bottom:10px}
+.dl-wrap{text-align:center;margin:0 auto 30px}
+.dl-btn{font:inherit;font-size:11px;font-weight:700;color:#4b5563;
+background:#fff;border:1px solid #d1d5db;border-radius:6px;padding:6px 14px;
+cursor:pointer;letter-spacing:.2px}
+.dl-btn:hover{color:#12141a;border-color:#9ca3af}
+.dl-btn:disabled{cursor:default;opacity:.6}
 @media print{body{background:#fff;padding:0}
 .page{box-shadow:none;margin:0;page-break-after:always;border-radius:0}
-.footer{display:none}}
+.footer,.dl-wrap{display:none}}
 """
 
 
@@ -966,7 +1105,12 @@ def render_page(title, subtitle, cols, rows, prev_week, key_col, note):
 <div class="note">{html.escape(note)}</div></div>"""
 
 
-def write_html(path, league_name, pages, generated_at, week, season):
+HTML2CANVAS_URL = ("https://cdnjs.cloudflare.com/ajax/libs/html2canvas/"
+                   "1.4.1/html2canvas.min.js")
+
+
+def write_html(path, league_name, pages, generated_at, week, season,
+               page_slugs=()):
     """
     Writes the report and wires up prev/next week navigation in the footer.
 
@@ -985,7 +1129,47 @@ def write_html(path, league_name, pages, generated_at, week, season):
     Only checks the adjacent week within the same season folder (both files
     live in the same directory by construction -- see html_path()), not
     across a season boundary.
+
+    Below the footer sits a "Save tables as images" button. It loads
+    html2canvas from cdnjs only when clicked, renders each table card
+    (.page) at 2x, and downloads them one by one as PNGs named from
+    `page_slugs`, e.g. 2026_W3_overall.png. Browsers may ask once to allow
+    multiple downloads from the site. It needs to be served over http(s)
+    (GitHub Pages is fine): opened straight from disk as file://, Chrome
+    treats the team icons as cross-origin and refuses to export the canvas.
     """
+    names = json.dumps([f"{season}_W{week}_{slug}" for slug in page_slugs])
+    download = (
+        f'<div class="dl-wrap"><button class="dl-btn" id="dlBtn" type="button">'
+        f'Save tables as images</button></div>'
+        f'<script>(function(){{'
+        f'var btn=document.getElementById("dlBtn"),label=btn.textContent;'
+        f'var names={names};'
+        f'function done(msg){{btn.disabled=false;btn.textContent=msg||label;'
+        f'if(msg)setTimeout(function(){{btn.textContent=label;}},4000);}}'
+        f'function lib(cb){{if(window.html2canvas)return cb();'
+        f'var s=document.createElement("script");s.src="{HTML2CANVAS_URL}";'
+        f's.onload=cb;s.onerror=function(){{done("Could not load image library");}};'
+        f'document.head.appendChild(s);}}'
+        f'function save(blob,name){{var a=document.createElement("a");'
+        f'a.href=URL.createObjectURL(blob);a.download=name+".png";'
+        f'document.body.appendChild(a);a.click();'
+        f'setTimeout(function(){{URL.revokeObjectURL(a.href);a.remove();}},2000);}}'
+        f'btn.addEventListener("click",function(){{'
+        f'btn.disabled=true;btn.textContent="Rendering\u2026";'
+        f'lib(function(){{var pages=document.querySelectorAll(".page"),i=0;'
+        f'(function next(){{'
+        f'if(i>=pages.length)return done();'
+        f'var name=names[i]||("table_"+(i+1));'
+        f'btn.textContent="Saving "+(i+1)+" of "+pages.length+"\u2026";'
+        f'html2canvas(pages[i],{{scale:2,backgroundColor:null,logging:false}})'
+        f'.then(function(c){{c.toBlob(function(b){{'
+        f'if(!b)return done("Export failed");save(b,name);i++;setTimeout(next,350);'
+        f'}},"image/png");}})'
+        f'.catch(function(){{done("Export failed");}});'
+        f'}})();}});}});'
+        f'}})();</script>'
+    )
     footer = (
         f'<div class="footer">'
         f'<span class="nav-prev" id="navPrev"></span>'
@@ -1018,7 +1202,7 @@ def write_html(path, league_name, pages, generated_at, week, season):
     with open(path, "w") as f:
         f.write(f"<!doctype html><html><head><meta charset='utf-8'>"
                 f"<title>{html.escape(league_name)}</title><style>{CSS}</style>"
-                f"</head><body>{''.join(pages)}{footer}</body></html>")
+                f"</head><body>{''.join(pages)}{footer}{download}</body></html>")
     return path
 
 
@@ -1043,8 +1227,7 @@ def main():
     rosters = sleeper(f"/league/{LEAGUE_ID}/rosters")
     users = {u["user_id"]: u for u in sleeper(f"/league/{LEAGUE_ID}/users")}
     state = sleeper("/state/nfl")
-    players = get_json("https://api.sleeper.app/v1/players/nfl",
-                       cache_key="players_nfl")
+    players = get_json("https://api.sleeper.app/v1/players/nfl")
 
     season = int(league["season"])
     start_slots = [s for s in league["roster_positions"]
@@ -1198,12 +1381,11 @@ def main():
               for r in rids}
     coach = {r: (100.0 * sum(weekly[r]) / sum(optimal[r])
                  if sum(optimal[r]) > 0 else 0.0) for r in rids}
-    # LUCK as a percentage: how far your actual win rate sits above or below
-    # your all-play ("deserved") win rate, relative to that deserved rate.
-    # +25 means your record is 25% better than your scoring earned; -100
-    # means you have zero wins despite a schedule-deserved win rate above
-    # zero (as unlucky as it gets). This is a straight linear rescale of the
-    # old ratio (percent = (ratio - 1) * 100), so it changes nothing about
+    # LUCK: how far your actual win rate sits above or below your all-play
+    # ("deserved") win rate, relative to that deserved rate, scaled by 10
+    # (so -10 is as unlucky as it gets: zero wins despite a deserved win
+    # rate above zero). This is a straight linear rescale of the old ratio
+    # ((ratio - 1) * 10), so it changes nothing about
     # PWR/rankings -- z-scores are invariant to affine transforms -- it just
     # makes the number itself read sensibly instead of centering on 1.00.
     #
@@ -1226,8 +1408,6 @@ def main():
     # Rebuilt from EVERY completed week each run and merged into the stored
     # records (see merge_records) -- that's what keeps the hourly re-runs
     # idempotent and lets a missed run heal itself on the next one.
-    # Streaks only look within this season: each Sleeper season is a new
-    # league_id, so a streak can't be followed across the offseason.
     def player_name(pid):
         p = players.get(pid) or {}
         return (p.get("full_name") or
@@ -1243,7 +1423,6 @@ def main():
         return row
 
     record_cands = []
-    results = {rid: {} for rid in rids}      # rid -> {week: 'W'/'L'/'T'}
     for wk_ in completed:
         ms = matchups_by_week[wk_]
         pts = {m["roster_id"]: (m.get("points") or 0.0) for m in ms}
@@ -1282,24 +1461,50 @@ def main():
                 record_cands.append(cand(rec, a, wk_, total,
                                          opp_team=names[b],
                                          opp_username=owners[b]))
-            results[a][wk_] = "W" if pts[a] > pts[b] else "L" if pts[a] < pts[b] else "T"
-            results[b][wk_] = "W" if pts[b] > pts[a] else "L" if pts[b] < pts[a] else "T"
 
-    for rid in rids:
-        for outcome, rec in (("W", "win_streak"), ("L", "loss_streak")):
-            run_start, run_len, prev_wk = None, 0, None
-            for wk_ in completed + [None]:          # sentinel flushes last run
-                hit = wk_ is not None and results[rid].get(wk_) == outcome
-                if hit:
-                    if run_len == 0:
-                        run_start = wk_
-                    run_len += 1
-                    prev_wk = wk_
-                elif run_len:
-                    record_cands.append(cand(rec, rid, run_start, run_len,
-                                             end_season=season,
-                                             end_week=prev_wk))
-                    run_len = 0
+    # Streaks: every owner's full history -- all prior seasons (regular
+    # season + playoffs) followed by this season so far (plus this league's
+    # own playoff games once any are final, e.g. an offseason re-run).
+    # If any history fetch fails, no streak candidates are produced this
+    # run: stored streak records are left exactly as they were rather than
+    # risking a truncated streak being recorded with the wrong start.
+    try:
+        history, past_info = [], {}
+        for lg in previous_leagues(league):
+            games, info = past_season_games(lg)
+            history += games
+            past_info.update(info)                  # later seasons win
+        cur_owner = {r["roster_id"]: r.get("owner_id") for r in rosters}
+        cur_winners = cur_losers = None
+        if STREAKS_INCLUDE_PLAYOFFS:
+            cur_winners = sleeper(f"/league/{LEAGUE_ID}/winners_bracket")
+            if STREAKS_INCLUDE_CONSOLATION:
+                cur_losers = sleeper(f"/league/{LEAGUE_ID}/losers_bracket")
+        history += season_game_log(season, league.get("settings") or {},
+                                   cur_owner, matchups_by_week,
+                                   cur_winners, cur_losers)
+        streak_ok = True
+    except Exception as e:
+        print(f"  [debug] couldn't build full game history ({e}); "
+              f"leaving stored streak records untouched this run")
+        streak_ok = False
+
+    if streak_ok:
+        rid_of_user = {v: k for k, v in cur_owner.items() if v}
+        for uid, runs in streak_runs(history).items():
+            if uid in rid_of_user:              # current member: current names
+                team, handle = names[rid_of_user[uid]], owners[rid_of_user[uid]]
+            elif uid in past_info:              # former member
+                team, handle = past_info[uid]
+            else:
+                continue
+            for outcome, length, (s0, w0), (s1, w1) in runs:
+                record_cands.append({
+                    "record": "win_streak" if outcome == "W" else "loss_streak",
+                    "team": team, "username": handle,
+                    "opp_team": "", "opp_username": "",
+                    "season": s0, "week": w0, "end_season": s1, "end_week": w1,
+                    "value": float(length), "player": ""})
 
     # --- expected win rate --------------------------------------------------
     roster_players = {r["roster_id"]: (r.get("players") or []) for r in rosters}
@@ -1578,7 +1783,8 @@ def main():
 
     os.makedirs(season_dir(season), exist_ok=True)
     paths.append(write_html(html_path(season, wk), league["name"], pages,
-                            generated_at, wk, season))
+                            generated_at, wk, season,
+                            ["overall", "power", "longterm", "records"]))
     print("\nWrote:\n  " + "\n  ".join(paths))
 
 

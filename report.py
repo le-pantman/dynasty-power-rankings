@@ -112,6 +112,12 @@ PICK_SLOT_START_WEEK = 11
 # the hourly re-runs of the same week never double-count anything).
 RECORDS_CSV = "records.csv"          # lives directly under OUTPUT_DIR
 
+# Empty grey strip under the all-time records table, sized in table rows
+# (1, 1.5, 2, ...). The other tables have a legend there; this gives the
+# records table the same breathing room so the bottom-right values aren't
+# covered by overlays like the iPhone Live Text button on screenshots.
+LEADERBOARD_BUFFER_ROWS = 1.5
+
 # Win/loss streaks are computed over each owner's COMPLETE game history:
 # every prior season (followed back through Sleeper's previous_league_id
 # chain), including playoff games, then into the current season. Owners are
@@ -867,6 +873,9 @@ def record_is_new(row, season, week):
     return (row["season"], row["week"]) == (season, week)
 
 
+LB_ROW_PX = 46   # measured height of one single-line records-table row
+
+
 def render_leaderboard(title, subtitle, records, season, week):
     def who(team, user):
         return (f'{html.escape(team)} <span class="lb-user">'
@@ -907,7 +916,8 @@ def render_leaderboard(title, subtitle, records, season, week):
     return f"""<div class="page"><div class="bar"></div>
 <div class="head"><h1>{html.escape(title)}</h1><div class="sub">{html.escape(subtitle)}</div></div>
 <table class="lb"><thead><tr><th class="l">Record</th><th class="l">Team</th><th class="l">When</th><th>Value</th></tr></thead>
-<tbody>{body}</tbody></table></div>"""
+<tbody>{body}</tbody></table>
+<div class="lb-buffer" style="height:{LEADERBOARD_BUFFER_ROWS * LB_ROW_PX:g}px"></div></div>"""
 
 
 def season_dir(season):
@@ -1054,6 +1064,7 @@ table.lb td.lb-rec{border-bottom:1px solid #eef0f3}
 .lb-vs{color:#9ca3af;font-size:.85em}
 td.lb-new-good{background:rgba(22,163,74,.16)}
 td.lb-new-bad{background:rgba(220,38,38,.14)}
+.lb-buffer{background:#fafbfc;border-top:1px solid #e3e5ea}
 .footer{max-width:940px;margin:0 auto 26px;display:flex;align-items:center;
 font-size:11px;color:#9ca1ac}
 .footer .nav-prev{flex:1 1 0;text-align:right}

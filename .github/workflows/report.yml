@@ -9,11 +9,19 @@ on:
     branches: [main]
     paths:
       - 'report.py'
-      - 'reports/*'
+      # '**' matches files at ANY depth under reports/ (icons, records.csv,
+      # season folders...). A single '*' would only match files sitting
+      # directly in reports/, missing reports/icons/icons.csv and the like.
+      - 'reports/**'
   workflow_dispatch: {}   # lets you trigger it manually from the Actions tab
 
+# No infinite loop: this job pushes its own changes to reports/, but pushes
+# made with the built-in GITHUB_TOKEN never trigger another workflow run, so
+# the bot's commit can't re-fire the 'reports/**' trigger. (That would stop
+# being true if the push step were switched to a personal access token.)
+
 # Stops overlapping runs from racing each other if one run is still going
-# when the next hour's trigger fires (shouldn't normally happen, but cheap
+# when the next trigger fires (shouldn't normally happen, but cheap
 # insurance).
 concurrency:
   group: hourly-league-report
@@ -49,5 +57,9 @@ jobs:
             echo "No new report this run (week in progress, off-season, or postseason) -- nothing to commit."
           else
             git commit -m "Auto-update league report ($(date -u +'%Y-%m-%d %H:%M UTC'))"
+            # If you pushed something (e.g. a new icon) while this run was
+            # going, main has moved on and a plain push would be rejected.
+            # Replay this commit on top of it first.
+            git pull --rebase origin main
             git push
           fi

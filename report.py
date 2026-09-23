@@ -27,6 +27,8 @@ import statistics
 from zoneinfo import ZoneInfo
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 try:
     from curl_cffi import requests as curl_requests
@@ -187,9 +189,26 @@ ARROW = {"up": "&#9650;", "down": "&#9660;"}
 # HTTP helpers
 # ----------------------------------------------------------------------------
 
+# One shared session: reuses connections (faster) and retries transient
+# failures -- timeouts, dropped connections, rate limits (429) and server
+# errors (5xx) -- with increasing waits between attempts, instead of letting
+# one slow response from Sleeper kill the whole run.
+_RETRY = Retry(
+    total=4, connect=4, read=4, status=4,
+    backoff_factor=2,
+    status_forcelist=(429, 500, 502, 503, 504),
+    allowed_methods=("GET",),
+    raise_on_status=False,
+)
+_SESSION = requests.Session()
+_SESSION.mount("https://", HTTPAdapter(max_retries=_RETRY))
+_SESSION.mount("http://", HTTPAdapter(max_retries=_RETRY))
+
+
 def get_json(url, params=None, headers=None):
-    """GET, always live (no caching). Raises loudly so failures are obvious."""
-    r = requests.get(url, params=params, timeout=30,
+    """GET, always live (no caching). Retries transient failures; raises
+    loudly if a request still fails after all retries."""
+    r = _SESSION.get(url, params=params, timeout=(10, 30),
                      headers=headers or {"User-Agent": "league-metrics/1.0"})
     if r.status_code != 200:
         raise RuntimeError(f"{r.status_code} from {r.url}")

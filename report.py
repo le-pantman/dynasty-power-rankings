@@ -4,8 +4,8 @@ Sleeper dynasty league metrics (12-team, 1QB, PPR).
 
 Outputs four tables:
   1. Overall metrics          : PWR, LONG, OVERALL
-  2. Current-season metrics   : VALUE, PF AVG, PF VAR, COACH, EXP WR, LUCK, PWR
-  3. Future-season metrics    : AGE AVG, DYN, PICKS, LONG
+  2. Current-season metrics   : VALUE (redraft), PF AVG, PF VAR, COACH, EXP WR, LUCK, PWR
+  3. Future-season metrics    : AGE AVG, DYN VAL, DYN, PICKS, DRAFT, TRADE, LONG
   4. All-time records leaderboard (persisted in reports/records.csv)
 
 The script refuses to run mid-week: it only ever reports on the most recently
@@ -82,9 +82,36 @@ PWR_WEIGHTS_LATE = {
 
 LONG_WEIGHTS = {
     "AGE_AVG": -0.25,   # younger is better
-    "DYN": 0.35,        # dynasty value above redraft value = long-term assets
+    "DYN_VALUE": 0.35,  # roster strength in dynasty terms (all future seasons)
+    "DYN": 0.15,        # dynasty value above redraft value: a small boost for
+                        # long-term focus without it dominating the rating
     "PICKS": 0.40,
+    "DRAFT": 0.15,      # drafting skill: value gained over draft position
+    "TRADE": 0.15,      # trading skill: net value won in trades
 }
+
+# --- draft & trade ratings ----------------------------------------------------
+# Both cover every season (current league + the previous_league_id chain)
+# and are judged on CURRENT FantasyCalc dynasty values, i.e. in hindsight.
+#
+# DRAFT: for each completed draft (startup and rookie), every drafted player
+# is ranked by current value; the k-th pick "should" have returned the k-th
+# most valuable player in that draft. A pick scores (its player's value -
+# that expectation). Each draft's scores are divided by their spread so a
+# 300-pick startup doesn't drown out 36-pick rookie drafts, then summed per
+# manager. Players count whether or not they're still rostered -- this
+# rates the selection; what happened afterwards is TRADE's job.
+#
+# TRADE: every completed trade, valued at today's values. Each asset only
+# counts for what it's worth above a free waiver pickup:
+#     adj = max(0, value - REPLACEMENT)
+# so two depth pieces don't "beat" one stud. REPLACEMENT is the value of the
+# Nth most valuable player, N = teams x TOP_N_FOR_VALUE (roughly the last
+# rostered player) unless TRADE_REPLACEMENT_RANK overrides it. Future picks
+# use the same valuation as PICKS; picks that have since been used are
+# worth the player drafted with them. FAAB in trades is ignored.
+TRADE_REPLACEMENT_RANK = None
+TRANSACTION_LEGS = range(0, 19)       # Sleeper "weeks" scanned for trades
 
 # --- running joke -----------------------------------------------------------
 # When True, this Sleeper username is always forced to the bottom row of the
@@ -153,8 +180,8 @@ OUTPUT_DIR = "reports"
 # up/down arrows, the legend, the CSV columns, and which cells get bolded as
 # the column's best value -- edit here only.
 CURRENT_COLS = [
-    ("VALUE",  "up",   "Team Value: Mean FantasyCalc dynasty trade value of the 22 most "
-                       "valuable assets on the roster."),
+    ("VALUE",  "up",   "Team Value: Mean FantasyCalc redraft (this season only) trade value "
+                       "of the 22 most valuable players on the roster."),
     ("PF AVG", "up",   "Average Points-for: Average points scored per completed week."),
     ("PF VAR", "down", "Scoring Consistency: Standard deviation of weekly score. Lower means a "
                        "more predictable team."),
@@ -172,12 +199,21 @@ CURRENT_COLS = [
 ]
 FUTURE_COLS = [
     ("AGE AVG", "down", "Team Age: Average age across the whole roster."),
+    ("DYN VAL", "up",   "Dynasty Value: Mean FantasyCalc dynasty trade value of the 22 most "
+                        "valuable players on the roster."),
     ("DYN",     "up",   "Dynasty Differential: FantasyCalc dynasty value minus redraft value. Higher means more "
                         "of the team's worth sits in future seasons."),
     ("PICKS",   "up",   "Draft Capital: Combined FantasyCalc value of every future rookie "
                         "pick the team owns."),
-    ("LONG",    "up",   "Longevity Score: Weighted blend of age, dynasty differential and draft "
-                        "capital, scaled 0-100."),
+    ("DRAFT",   "up",   "Draft Rating: Current value of each player drafted versus what that "
+                        "draft slot returned in hindsight, summed across all drafts. Positive "
+                        "means the manager beat their draft position."),
+    ("TRADE",   "up",   "Trade Rating: Net current value won across all trades, counting each "
+                        "asset only for its value above a waiver-level player. Used picks count "
+                        "as the player drafted with them."),
+    ("LONG",    "up",   "Longevity Score: Weighted blend of age, dynasty value, dynasty "
+                        "differential, draft capital, draft rating and trade rating, "
+                        "scaled 0-100."),
 ]
 OVERALL_COLS = [
     ("PWR",     "up", "Power Rating: This season's performance/value score. "
@@ -757,6 +793,109 @@ def past_season_games(lg):
         if STREAKS_INCLUDE_CONSOLATION:
             losers = sleeper(f"/league/{lid}/losers_bracket")
     return season_game_log(season, settings, owner, mbw, winners, losers), info
+
+
+# ----------------------------------------------------------------------------
+# Draft & trade ratings
+# ----------------------------------------------------------------------------
+
+def score_draft(picks, value_of, roster_owner):
+    """
+    {user_id: normalized score} for one completed draft (see DRAFT config).
+
+    Zero-sum within the draft: the k-th pick is compared with the k-th most
+    valuable player taken, so the scores of every pick in a draft add up to
+    zero. Credit goes to whoever made the selection (picked_by), falling
+    back to the owner of the roster holding the pick. Keeper slots are
+    skipped -- nobody chose them.
+    """
+    picks = sorted((p for p in picks
+                    if p.get("player_id") and not p.get("is_keeper")),
+                   key=lambda p: p.get("pick_no") or 0)
+    actual = [value_of(str(p["player_id"])) for p in picks]
+    expected = sorted(actual, reverse=True)
+    scores = [a - e for a, e in zip(actual, expected)]
+    spread = statistics.pstdev(scores) if len(scores) > 1 else 0.0
+    out = {}
+    for p, sc in zip(picks, scores):
+        uid = p.get("picked_by") or roster_owner.get(p.get("roster_id"))
+        if not uid:
+            continue
+        out[uid] = out.get(uid, 0.0) + (sc / spread if spread else 0.0)
+    return out
+
+
+def score_trade(txn, roster_owner, adj_player, adj_pick):
+    """
+    {user_id: net adjusted value} for one completed trade (see TRADE config).
+
+    Only assets that actually moved between teams count: a player appears in
+    both `adds` (receiving roster) and `drops` (sending roster). A drop
+    with no matching add is a release, not something the other side
+    received, so it's ignored -- which also keeps every trade zero-sum.
+    """
+    out = {}
+
+    def credit(rid, v):
+        uid = roster_owner.get(rid)
+        if uid:
+            out[uid] = out.get(uid, 0.0) + v
+
+    adds, drops = txn.get("adds") or {}, txn.get("drops") or {}
+    for pid, to_rid in adds.items():
+        from_rid = drops.get(pid)
+        if from_rid is None or from_rid == to_rid:
+            continue
+        v = adj_player(str(pid))
+        credit(to_rid, v)
+        credit(from_rid, -v)
+    for dp in txn.get("draft_picks") or []:
+        to_rid, from_rid = dp.get("owner_id"), dp.get("previous_owner_id")
+        if to_rid is None or from_rid is None or to_rid == from_rid:
+            continue
+        v = adj_pick(int(dp["season"]), int(dp["round"]), dp.get("roster_id"))
+        credit(to_rid, v)
+        credit(from_rid, -v)
+    return out
+
+
+def drafted_pick_index(draft, picks):
+    """
+    {(season, round, original_roster_id): player_id} for a completed draft,
+    so a traded pick can be resolved to the player it became. The original
+    owner of a draft column comes from the draft's slot_to_roster_id.
+    """
+    slot_owner = {int(k): v for k, v in (draft.get("slot_to_roster_id") or {}).items()}
+    season = int(draft["season"])
+    out = {}
+    for p in picks:
+        orig = slot_owner.get(p.get("draft_slot"))
+        if orig is not None and p.get("player_id"):
+            out[(season, int(p["round"]), orig)] = str(p["player_id"])
+    return out
+
+
+def league_drafts_and_trades(lg):
+    """
+    (roster_owner, [(draft, picks), ...], [trade transactions]) for one
+    league-season. Only completed drafts and completed trades are returned.
+    """
+    lid = lg["league_id"]
+    rosters = sleeper(f"/league/{lid}/rosters")
+    roster_owner = {r["roster_id"]: r.get("owner_id") for r in rosters}
+    drafts = []
+    for d in sleeper(f"/league/{lid}/drafts") or []:
+        if d.get("status") == "complete":
+            drafts.append((d, sleeper(f"/draft/{d['draft_id']}/picks") or []))
+    trades, seen = [], set()
+    for leg in TRANSACTION_LEGS:
+        for t in sleeper(f"/league/{lid}/transactions/{leg}") or []:
+            tid = t.get("transaction_id")
+            if (t.get("type") == "trade" and t.get("status") == "complete"
+                    and tid not in seen):
+                seen.add(tid)
+                trades.append(t)
+    return roster_owner, drafts, trades
 
 
 # ----------------------------------------------------------------------------
@@ -1672,14 +1811,71 @@ def main():
         print(f"  [debug] expected but missing FantasyCalc pick values: "
               f"{sorted(unexpected)}")
 
+    # --- draft & trade ratings ------------------------------------------------
+    # Gathered across every season so far. No fail-safe here on purpose: if a
+    # fetch still fails after the HTTP retries, the run aborts and commits
+    # nothing (next hour tries again) rather than publishing a LONG score
+    # built on half the history.
+    def player_val(pid):
+        return dyn_vals.get(pid, 0.0)
+
+    league_seasons = previous_leagues(league) + [league]
+    gathered = [league_drafts_and_trades(lg) for lg in league_seasons]
+
+    pick_results = {}
+    for _owner, drafts_, _trades in gathered:
+        for d, dpicks in drafts_:
+            pick_results.update(drafted_pick_index(d, dpicks))
+
+    player_values_sorted = sorted(dyn_vals.values(), reverse=True)
+    rank = TRADE_REPLACEMENT_RANK or num_teams * TOP_N_FOR_VALUE
+    replacement = (player_values_sorted[rank - 1]
+                   if len(player_values_sorted) >= rank else 0.0)
+
+    def adj_player(pid):
+        return max(0.0, player_val(pid) - replacement)
+
+    def adj_pick(s, rnd, orig):
+        pid = pick_results.get((s, rnd, orig))
+        if pid is not None:                       # already used: the player
+            return adj_player(pid)
+        if s > season:                            # still a future pick
+            mode = (next_mode if s == season + 1 and orig in proj_slot
+                    else "round")
+            v, _ = pick_value(pick_values, s, rnd, proj_slot.get(orig, 0),
+                              mode, num_teams)
+            return max(0.0, (v or 0.0) - replacement)
+        v, _ = pick_value(pick_values, s, rnd, 0, "round", num_teams)
+        return max(0.0, (v or 0.0) - replacement)
+
+    draft_by_user, trade_by_user = {}, {}
+    n_drafts = n_trades = 0
+    for roster_owner, drafts_, trades_ in gathered:
+        for _d, dpicks in drafts_:
+            n_drafts += 1
+            for uid, v in score_draft(dpicks, player_val, roster_owner).items():
+                draft_by_user[uid] = draft_by_user.get(uid, 0.0) + v
+        for t in trades_:
+            n_trades += 1
+            for uid, v in score_trade(t, roster_owner, adj_player, adj_pick).items():
+                trade_by_user[uid] = trade_by_user.get(uid, 0.0) + v
+
+    owner_uid = {r["roster_id"]: r.get("owner_id") for r in rosters}
+    draft_rating = {r: draft_by_user.get(owner_uid[r], 0.0) for r in rids}
+    trade_rating = {r: trade_by_user.get(owner_uid[r], 0.0) for r in rids}
+    print(f"  Draft/trade ratings from {n_drafts} draft(s) and {n_trades} "
+          f"trade(s); waiver-level replacement value = {replacement:.0f}")
+
     # --- composites ---------------------------------------------------------
     def zmap(metric):
         return dict(zip(rids, zscores([metric[r] for r in rids])))
 
     z = {k: zmap(m) for k, m in {
-        "VALUE": value, "PF_AVG": pf_avg, "PF_VAR": pf_var,
+        "VALUE": redraft_value, "DYN_VALUE": value,
+        "PF_AVG": pf_avg, "PF_VAR": pf_var,
         "COACH": coach, "EXP_WR": exp_wr, "LUCK": luck,
         "AGE_AVG": age_avg, "DYN": dyn_diff, "PICKS": picks,
+        "DRAFT": draft_rating, "TRADE": trade_rating,
     }.items()}
 
     # Blend early -> late weights based on how much of the season is in the books.
@@ -1703,7 +1899,7 @@ def main():
 
     # None = no data yet, rendered as "-" and left blank in the CSV rather than
     # printed as 0.0, which would read like a real measurement.
-    cur_raw = {r: {"VALUE": value[r],
+    cur_raw = {r: {"VALUE": redraft_value[r],
                    "PF AVG": pf_avg[r] if have else None,
                    "PF VAR": pf_var[r] if have_var else None,
                    "COACH": coach[r] if have else None,
@@ -1713,9 +1909,11 @@ def main():
     cur_fmt = {"VALUE": ".0f", "PF AVG": ".1f", "PF VAR": ".1f", "COACH": ".1f",
                "EXP WR": ".3f", "LUCK": "+.0f", "PWR": ".1f"}
 
-    fut_raw = {r: {"AGE AVG": age_avg[r], "DYN": dyn_diff[r],
-                   "PICKS": picks[r], "LONG": long_score[r]} for r in rids}
-    fut_fmt = {"AGE AVG": ".1f", "DYN": "+.0f", "PICKS": ".0f", "LONG": ".1f"}
+    fut_raw = {r: {"AGE AVG": age_avg[r], "DYN VAL": value[r], "DYN": dyn_diff[r],
+                   "PICKS": picks[r], "DRAFT": draft_rating[r],
+                   "TRADE": trade_rating[r], "LONG": long_score[r]} for r in rids}
+    fut_fmt = {"AGE AVG": ".1f", "DYN VAL": ".0f", "DYN": "+.0f", "PICKS": ".0f",
+               "DRAFT": "+.1f", "TRADE": "+.0f", "LONG": ".1f"}
 
     ovr_raw = {r: {"PWR": pwr[r], "LONG": long_score[r],
                    "OVERALL": overall_score[r]} for r in rids}

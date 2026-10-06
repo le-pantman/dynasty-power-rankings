@@ -1571,7 +1571,7 @@ def main():
             continue
         actual_wr = wins[r] / len(completed)
         allplay_wr = allplay_wins[r] / allplay_games[r]
-        luck[r] = (actual_wr - allplay_wr) / allplay_wr * 10.0
+        luck[r] = (actual_wr - allplay_wr) / allplay_wr * 100.0
 
     # --- record candidates ---------------------------------------------------
     # Rebuilt from EVERY completed week each run and merged into the stored

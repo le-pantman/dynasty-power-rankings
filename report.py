@@ -205,11 +205,11 @@ FUTURE_COLS = [
                         "of the team's worth sits in future seasons."),
     ("PICKS",   "up",   "Draft Capital: Combined FantasyCalc value of every future rookie "
                         "pick the team owns."),
-    ("DRAFT",   "up",   "Draft Rating: Current value of each player drafted versus what that "
-                        "draft slot returned in hindsight, summed across all drafts. Positive "
+    ("DRAFT",   "up",   "Draft Rating: Rating of draft slot vs current player value, "
+                        "summed across all drafts. Positive "
                         "means the manager beat their draft position."),
-    ("TRADE",   "up",   "Trade Rating: Net current value won across all trades, counting each "
-                        "asset only for its value above a waiver-level player. Used picks count "
+    ("TRADE",   "up",   "Trade Rating: Net current value won across all trades."
+                        " Used picks count "
                         "as the player drafted with them."),
     ("LONG",    "up",   "Longevity Score: Weighted blend of age, dynasty value, dynasty "
                         "differential, draft capital, draft rating and trade rating, "

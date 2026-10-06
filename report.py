@@ -189,10 +189,9 @@ CURRENT_COLS = [
                        "the maximum the roster could have scored."),
     ("EXP WR", "up",   "Expected Win Rate: Wins so far plus projected win probability for every "
                        "remaining matchup, divided by the number of weeks in the season."),
-    ("LUCK",   "down", "Luck Factor: How far your actual win rate sits above or below "
-                       "your all-play (deserved) win rate, as a percentage of that "
-                       "deserved rate. Positive means your record is better than your "
-                       "scoring earned; negative means worse."),
+    ("LUCK",   "down", "Luck Factor: Actual win rate vs "
+                       "all-play win rate. "
+                       "Positive indicates a luckier team."),
     ("PWR",    "up",   "Power Rating: Weighted blend of the z-scores above, scaled 0-100. "
                        "Weighting shifts from roster value toward results as "
                        "the season progresses."),

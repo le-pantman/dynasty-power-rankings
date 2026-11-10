@@ -1,8 +1,8 @@
 record,team,username,opp_team,opp_username,season,week,end_season,end_week,value,player
-high_score,MorsetheSeaHorse,MorsetheSeaHorse,,,2026,4,,,184.22,
+high_score,KingSoladi,KingSoladi,,,2026,9,,,218.66,
 low_score,jray14,jray14,,,2026,8,,,60.06,
 mvp,MorsetheSeaHorse,MorsetheSeaHorse,,,2026,4,,,45.2,Tetairoa McMillan
-win_streak,KingSoladi,KingSoladi,,,2026,1,2026,8,8,
-loss_streak,Optimus Slime,haymond,,,2026,2,2026,8,7,
-high_matchup,MorsetheSeaHorse,MorsetheSeaHorse,KingSoladi,KingSoladi,2026,1,,,318.3,
+win_streak,KingSoladi,KingSoladi,,,2026,1,2026,9,9,
+loss_streak,Optimus Slime,haymond,,,2026,2,2026,9,8,
+high_matchup,Optimus Slime,haymond,KingSoladi,KingSoladi,2026,9,,,323.72,
 low_matchup,Wright Dining Pasta,ctSQD,Optimus Slime,haymond,2026,2,,,162.16,
